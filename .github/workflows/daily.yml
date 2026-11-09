@@ -11,8 +11,11 @@ on:
         description: "false = dry run: fetch, build and check, upload nothing"
         type: boolean
         default: true
-  # Owner-approved. 17:13 UTC: after the late NOAA analysis hours and late reports have landed; never the top of the hour.
+  # Owner-approved. 08:23 UTC: yesterday's UTC day as soon as its last analysis hour is published (about 06Z) and
+  # before the 09:00-10:30 quiet window of the station archive. 17:13 UTC: a retry that only redoes groups that are
+  # still incomplete (late files, an upstream outage in the morning). Never the top of the hour.
   schedule:
+    - cron: "23 8 * * *"
     - cron: "13 17 * * *"
 
 permissions:
