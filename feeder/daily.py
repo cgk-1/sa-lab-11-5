@@ -39,7 +39,7 @@ def daily_noaa(ctx, day):
         mans = day_manifests(ctx.store, back)
         changed, sup = [], {}
         for g in ctx.cfg["noaa"]["groups"]:
-            entries = [newest_entry(mans, noaa.output_id(o), o["ver"]) for o in g["outputs"]]
+            entries = [newest_entry(mans, noaa.output_id(o), o["ver"]) for o in noaa.active_outputs(g)]
             entries = [e for e in entries if e]
             if entries and noaa.source_etags_changed(ctx, g, back, entries):
                 changed.append(g["id"])

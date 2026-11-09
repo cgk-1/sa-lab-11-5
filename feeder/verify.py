@@ -1,5 +1,5 @@
 """Re-verification: HEAD every object listed in the manifests (length must match), GET + sha256 on a seeded sample,
-a 206 range read of every PMTiles header, and a list of orphans (stored objects named in no manifest). Never
+a 206 range read of every PMTiles and exact-grid header (header failures of both count under ``pmtiles_fail``), and a list of orphans (stored objects named in no manifest). Never
 deletes anything."""
 
 import hashlib
@@ -29,6 +29,16 @@ def verify_objects(store, objects, share=0.02, min_n=3, seed=0, check_all=False)
             rep["get_fail"] += 1
             rep["failed_keys"].append(o["key"])
     for o in objects:
+        if o["key"].endswith(".xgrid"):
+            rep["xgrid_checked"] = rep.get("xgrid_checked", 0) + 1
+            try:
+                head, status = store.get(o["key"], (0, 23))
+                ok = status == 206 and head[:8] == b"XGRID001"
+            except Exception:
+                ok = False
+            if not ok:
+                rep["pmtiles_fail"] += 1
+                rep["failed_keys"].append(o["key"])
         if o["key"].endswith(".pmtiles"):
             rep["pmtiles_checked"] += 1
             try:

@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config", "datasets.json")
 

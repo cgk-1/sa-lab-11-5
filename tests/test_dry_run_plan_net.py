@@ -8,13 +8,14 @@ from feeder import plan
 from feeder import run as run_mod
 from feeder.net import Http, HttpError
 
-from conftest import DAY, add_urma, fake_decode
+from conftest import DAY, add_iem, add_urma, fake_decode
 
 
 # ---------------------------------------------------------------- dry run
 
 def test_dry_run_main_prints_manifest_and_uploads_nothing(monkeypatch, capsys, web, clock, cfg):
     add_urma(web)
+    add_iem(web)  # a dry run without storage reads the station catalogue live
     for n in ("S3_ENDPOINT", "S3_BUCKET", "S3_KEY_ID", "S3_SECRET"):
         monkeypatch.delenv(n, raising=False)
     small = dict(cfg)
@@ -29,6 +30,9 @@ def test_dry_run_main_prints_manifest_and_uploads_nothing(monkeypatch, capsys, w
     assert len(docs) == 1 and docs[0]["schema"] == "feed-day/1"
     for d in docs[0]["datasets"]:
         assert d["objects"] and all(len(o["sha256"]) == 64 for o in d["objects"])
+        assert d["status"] == "complete", d["id"]
+    ex = next(d for d in docs[0]["datasets"] if d["id"] == "urma-gust-ex")
+    assert ex["checks"]["station_points"] == 6  # IA + NE catalogues, 3 stations each
     assert "puts=0" in out
 
 

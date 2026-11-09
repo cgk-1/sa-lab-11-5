@@ -127,7 +127,7 @@ def shp_zip(polygons):
 # ---------------------------------------------------------------- checks
 
 def _checks():
-    from . import compact, load_config, sparse, stormbox, tile
+    from . import compact, exact, grib, load_config, sparse, stormbox, tile
     from .breaker import Breaker, BreakerTripped, Ledger
     from .manifest import DatasetEntry, DayManifest, validate
     from .store import OverwriteRefused, PrefixError, Store, src_key, tile_key, vintage_of
@@ -193,16 +193,45 @@ def _checks():
     def sparse_cube():
         rng = np.random.default_rng(1)
         shape = (40, 50)
-        cube = sparse.SparseCube(shape, 3, 35 / sparse.MPH_PER_MS, 10, [5, 77])
-        steps = [np.round(rng.uniform(0, 30, shape), 2) for _ in range(3)]
+        pack = {"template": 3, "R": 0.09325958788394928, "E": -4, "D": 0, "nbits": 9, "bitmap": False}
+        cube = sparse.SparseCube(shape, 3, 35 / sparse.MPH_PER_MS, 10, [5, 77], [6])
+        steps = [grib.ints_to_values(rng.integers(0, 512, shape), pack) for _ in range(3)]
         steps[1][3, 4] = np.nan
         for i, v in enumerate(steps):
-            cube.add_step(i, v)
+            cube.add_step(i, v, pack)
         data, rows = cube.to_parquet({"t": 1})
         assert sparse.decode_check(data, cube) and rows > 0
+        assert cube.max_quant_err == 0.0 and cube.exact_cells == cube.total_cells
         d = sparse.dense_step(data, 0)
         kept = np.isfinite(d)
-        assert np.allclose(d[kept], steps[0][kept], atol=0.005 + 1e-9)
+        assert grib.same_bits(d[kept], steps[0][kept])
+        lossy = sparse.SparseCube(shape, 1, 0.0, 1, [])
+        lossy.add_step(0, steps[0], None)  # 1/16 m/s values without their packing cannot be exact
+        assert not sparse.decode_check(lossy.to_parquet({})[0], lossy)
+
+    def exact_grid():
+        rng = np.random.default_rng(4)
+        shape = (150, 140)
+        pack = {"template": 0, "R": 0.0, "E": 0, "D": 2, "nbits": 12, "bitmap": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            cube = exact.ExactCube(shape, 3, tmp, 64, "dxy", 3, "auto", 2)
+            vals = [grib.ints_to_values(rng.integers(0, 4096, shape), pack) for _ in range(2)]
+            assert cube.add_step(0, "a", vals[0], pack, b"\x00" * 200000)["mode"] == "ints"
+            assert cube.add_step(2, "c", vals[1], pack, b"short")["mode"] == "grib"
+            data = cube.to_bytes({"layer": "x"})
+            cube.close()
+        ok, rep = exact.verify(data)
+        assert ok and rep["checked"] == 2
+        r = exact.ExactReader.from_bytes(data)
+        assert grib.same_bits(r.values(0), vals[0]) and r.step(1)["mode"] == "missing" and r.source(2) == b"short"
+        bad = bytearray(data)
+        bad[-200] ^= 1
+        assert not exact.verify(bytes(bad))[0]
+
+    def mesh_codes():
+        enc = tile.Encoding(cfg["encodings"]["mesh05"])
+        _, ov = enc.encode(np.array([-3.0, -1.0, 0.8, 50.0, -999.0, -99.0]))
+        assert not ov.any()
 
     def tiles():
         assert [tile.zxy_to_tileid(1, x, y) for x, y in ((0, 0), (0, 1), (1, 1), (1, 0))] == [1, 2, 3, 4]
@@ -252,7 +281,7 @@ def _checks():
             return "skipped (pygrib not installed)"
 
     return [("keys", keys), ("store", store), ("manifest", manifest), ("compact", compaction),
-            ("sparse", sparse_cube), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("pygrib", grib_lib)]
+            ("sparse", sparse_cube), ("exact", exact_grid), ("mesh-codes", mesh_codes), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("pygrib", grib_lib)]
 
 
 def main():

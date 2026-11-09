@@ -62,6 +62,14 @@ def test_inputs_never_interpolated_into_run_text():
             assert "${{" not in line, (name, line)
 
 
+def test_catalog_job_runs_before_the_lanes():
+    for name, text in _workflows().items():
+        assert "\n  catalog:\n" in text and "LANE: catalog" in text, name
+        for job in ("noaa", "iem"):
+            block = text.split(f"\n  {job}:\n", 1)[1].split("\n  ", 1)[0]
+            assert "catalog" in block and block.startswith("    needs:"), (name, job)
+
+
 def test_contact_from_repo_variable():
     for name, text in _workflows().items():
         assert "CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}" in text, name

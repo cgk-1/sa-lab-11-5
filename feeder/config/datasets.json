@@ -27,9 +27,13 @@
     "deg15":  {"factor": 1.0,             "offset": 0.0,    "step": 1.5, "specials": {},                        "nan_code": 254},
     "uvmph":  {"factor": 2.2369362920544, "offset": -126.0, "step": 1.0, "specials": {},                        "nan_code": 254},
     "dbz05":  {"factor": 1.0,             "offset": -32.0,  "step": 0.5, "specials": {"-999": 253, "-99": 252}, "nan_code": 254},
-    "mm05":   {"factor": 1.0,             "offset": 0.0,    "step": 0.5, "specials": {"-999": 253, "-99": 252}, "nan_code": 254}
+    "mesh05": {"factor": 1.0,             "offset": 0.0,    "step": 0.5,
+               "specials": {"-999": 253, "-99": 252, "-3": 251, "-1": 250},                     "nan_code": 254}
   },
   "tile_size": 128,
+
+  "exact": {"tile_size": 128, "zstd_level": 19, "workers": 4,
+            "note": "exact grids: GRIB packed integers in 128x128 zstd tiles, or the source message when smaller"},
 
   "noaa": {
     "groups": [
@@ -43,11 +47,15 @@
           "wdir": {"idx": "WDIR:10 m above ground:anl", "grib": [0, 2, 0]}
         },
         "outputs": [
-          {"kind": "sparse", "dataset": "urma-gust-ex", "ver": "v1", "field": "gust",
-           "threshold_mph": 35.0, "lattice_step": 10, "station_points": true},
-          {"kind": "tile", "layer": "urma-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05"},
-          {"kind": "tile", "layer": "urma-wind-u8", "ver": "v1", "field": "wind", "enc": "mph05"},
-          {"kind": "tile", "layer": "urma-wdir-u8", "ver": "v1", "field": "wdir", "enc": "deg15"},
+          {"kind": "exact", "dataset": "urma-gust-x", "ver": "v1", "field": "gust", "store": "auto", "predictor": "dxy",
+           "station_points": true},
+          {"kind": "exact", "dataset": "urma-wind-x", "ver": "v1", "field": "wind", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "urma-wdir-x", "ver": "v1", "field": "wdir", "store": "auto", "predictor": "dxy"},
+          {"kind": "sparse", "dataset": "urma-gust-ex", "ver": "v2", "field": "gust",
+           "threshold_mph": 35.0, "lattice_step": 10, "station_points": true, "halo": 1, "exact": true},
+          {"kind": "tile", "layer": "urma-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05", "enabled": false},
+          {"kind": "tile", "layer": "urma-wind-u8", "ver": "v1", "field": "wind", "enc": "mph05", "enabled": false},
+          {"kind": "tile", "layer": "urma-wdir-u8", "ver": "v1", "field": "wdir", "enc": "deg15", "enabled": false},
           {"kind": "boxflags", "dataset": "boxflags-urma", "ver": "v1", "field": "gust",
            "rule": "gust_mph", "threshold": 58.0, "min_cells": 8}
         ],
@@ -56,7 +64,8 @@
       {
         "id": "hrrr", "kind": "grib", "bucket": "noaa-hrrr-bdp-pds",
         "key": "hrrr.{ymd}/conus/hrrr.t{HH}z.wrfsfcf01.grib2",
-        "cadence_min": 60, "idx_suffix": ".idx", "valid_offset_min": 60,
+        "cadence_min": 60, "idx_suffix": ".idx", "valid_offset_min": 60, "gap_rule": true,
+        "known_gaps": ["2023-06-08T17:00:00Z", "2023-08-15T23:00:00Z"],
         "fields": {
           "gust": {"idx": "GUST:surface:1 hour fcst", "grib": [0, 2, 22],
                    "fallback": {"key": "hrrr.{ymd}/conus/hrrr.t{HH}z.wrfsfcf00.grib2", "idx": "GUST:surface:anl", "flag": "f00"}},
@@ -67,16 +76,23 @@
           "v80":  {"idx": "VGRD:80 m above ground:1 hour fcst", "grib": [0, 2, 3]}
         },
         "outputs": [
-          {"kind": "sparse", "dataset": "hrrr-gust-ex", "ver": "v1", "field": "gust",
-           "threshold_mph": 30.0, "lattice_step": 10, "station_points": true},
-          {"kind": "sparse", "dataset": "hrrr-wmax-ex", "ver": "v1", "field": "wmax",
-           "threshold_mph": 30.0, "lattice_step": 10, "station_points": true},
-          {"kind": "tile", "layer": "hrrr-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05"},
-          {"kind": "tile", "layer": "hrrr-wmax-u8", "ver": "v1", "field": "wmax", "enc": "mph05"},
-          {"kind": "tile", "layer": "hrrr-u10-u8", "ver": "v1", "field": "u10", "enc": "uvmph"},
-          {"kind": "tile", "layer": "hrrr-v10-u8", "ver": "v1", "field": "v10", "enc": "uvmph"},
-          {"kind": "tile", "layer": "hrrr-u80-u8", "ver": "v1", "field": "u80", "enc": "uvmph"},
-          {"kind": "tile", "layer": "hrrr-v80-u8", "ver": "v1", "field": "v80", "enc": "uvmph"}
+          {"kind": "exact", "dataset": "hrrr-gust-x", "ver": "v1", "field": "gust", "store": "auto", "predictor": "dxy",
+           "station_points": true},
+          {"kind": "exact", "dataset": "hrrr-wmax-x", "ver": "v1", "field": "wmax", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "hrrr-u10-x", "ver": "v1", "field": "u10", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "hrrr-v10-x", "ver": "v1", "field": "v10", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "hrrr-u80-x", "ver": "v1", "field": "u80", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "hrrr-v80-x", "ver": "v1", "field": "v80", "store": "auto", "predictor": "dxy"},
+          {"kind": "sparse", "dataset": "hrrr-gust-ex", "ver": "v2", "field": "gust",
+           "threshold_mph": 30.0, "lattice_step": 10, "station_points": true, "halo": 1, "exact": true},
+          {"kind": "sparse", "dataset": "hrrr-wmax-ex", "ver": "v2", "field": "wmax",
+           "threshold_mph": 30.0, "lattice_step": 10, "station_points": true, "halo": 1, "exact": true},
+          {"kind": "tile", "layer": "hrrr-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05", "enabled": false},
+          {"kind": "tile", "layer": "hrrr-wmax-u8", "ver": "v1", "field": "wmax", "enc": "mph05", "enabled": false},
+          {"kind": "tile", "layer": "hrrr-u10-u8", "ver": "v1", "field": "u10", "enc": "uvmph", "enabled": false},
+          {"kind": "tile", "layer": "hrrr-v10-u8", "ver": "v1", "field": "v10", "enc": "uvmph", "enabled": false},
+          {"kind": "tile", "layer": "hrrr-u80-u8", "ver": "v1", "field": "u80", "enc": "uvmph", "enabled": false},
+          {"kind": "tile", "layer": "hrrr-v80-u8", "ver": "v1", "field": "v80", "enc": "uvmph", "enabled": false}
         ],
         "era": []
       },
@@ -88,7 +104,8 @@
           "gust": {"idx": "GUST:10 m above ground:anl", "grib": [0, 2, 22]}
         },
         "outputs": [
-          {"kind": "tile", "layer": "ru-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05",
+          {"kind": "exact", "dataset": "ru-gust-x", "ver": "v1", "field": "gust", "store": "auto", "predictor": "dxy"},
+          {"kind": "tile", "layer": "ru-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05", "enabled": false,
            "overviews": [{"factor": 4, "layer": "ru-gust-u8-10k"}]}
         ],
         "era": []
@@ -104,7 +121,7 @@
         "source_order": ["aws", "mtarchive"],
         "outputs": [
           {"kind": "tar", "dataset": "mrms-mesh-raw", "ver": "v1", "products": ["mesh1440", "mesh60"]},
-          {"kind": "tile", "layer": "mesh-u8", "ver": "v1", "product": "mesh60", "enc": "mm05"},
+          {"kind": "tile", "layer": "mesh-u8", "ver": "v2", "product": "mesh60", "enc": "mesh05", "enabled": false},
           {"kind": "boxflags", "dataset": "boxflags-mesh", "ver": "v1", "product": "mesh60",
            "rule": "mesh_mm", "threshold": 25.4, "min_cells": 25}
         ],
@@ -115,16 +132,17 @@
         "prefix": "CONUS/MergedReflectivityQCComposite_00.50/{ymd}/",
         "time_regex": "_(\\d{8})-(\\d{6})\\.grib2\\.gz$", "pick_window_min": 2,
         "outputs": [
-          {"kind": "tile", "layer": "refl-u8", "ver": "v1", "enc": "dbz05"}
+          {"kind": "exact", "dataset": "refl-x", "ver": "v1", "store": "auto", "predictor": "raw"},
+          {"kind": "tile", "layer": "refl-u8", "ver": "v1", "enc": "dbz05", "enabled": false}
         ],
         "era": []
       },
       {
         "id": "probsevere", "kind": "listed-all", "bucket": "noaa-mrms-pds",
-        "prefix": "ProbSevere/PROBSEVERE/{ymd}/",
-        "time_regex": "_(\\d{8})_(\\d{6})\\.json$",
+        "prefix": "ProbSevere/{ymd}/",
+        "time_regex": "MRMS_PROBSEVERE_(\\d{8})_(\\d{6})\\.json$",
         "outputs": [
-          {"kind": "tar", "dataset": "probsevere-json", "ver": "v1"}
+          {"kind": "tar", "dataset": "probsevere-json", "ver": "v2"}
         ],
         "era": []
       }
@@ -135,16 +153,16 @@
     "base": "https://mesonet.agron.iastate.edu",
     "states": ["AL","AZ","AR","CA","CO","CT","DE","FL","GA","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI",
                "MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
-               "TX","UT","VT","VA","WA","WV","WI","WY","AK","HI","PR"],
+               "TX","UT","VT","VA","WA","WV","WI","WY","AK","HI","PR","VI","GU","AS"],
     "datasets": [
-      {"id": "iem-stations", "ver": "v1", "kind": "catalog", "enabled": true,
+      {"id": "iem-stations", "ver": "v2", "kind": "catalog", "enabled": true,
        "path": "/geojson/network/{net}.geojson", "networks": ["{ST}_ASOS", "{ST}_RWIS"]},
-      {"id": "iem-asos", "ver": "v1", "kind": "table", "enabled": true, "station_list": true,
+      {"id": "iem-asos", "ver": "v2", "kind": "table", "enabled": true, "station_list": true,
        "path": "/cgi-bin/request/asos.py", "networks": ["{ST}_ASOS"], "chunk": "month", "time_column": ["valid"],
        "params": [["data", "all"], ["tz", "Etc/UTC"], ["format", "onlycomma"], ["latlon", "yes"], ["elev", "yes"],
                   ["missing", "M"], ["trace", "T"], ["direct", "no"], ["report_type", "3"], ["report_type", "4"]],
        "time_params": "ymdhm", "refresh": [8, 36, 120]},
-      {"id": "iem-asos1min", "ver": "v1", "kind": "table", "enabled": true, "station_list": true,
+      {"id": "iem-asos1min", "ver": "v2", "kind": "table", "enabled": true, "station_list": true,
        "path": "/cgi-bin/request/asos1min.py", "networks": ["{ST}_ASOS"], "chunk": "month",
        "time_column": ["valid(UTC)", "valid"],
        "params": [["vars", "tmpf"], ["vars", "dwpf"], ["vars", "sknt"], ["vars", "drct"], ["vars", "gust_drct"],
@@ -153,11 +171,11 @@
                   ["vars", "precip"], ["vars", "pres1"], ["vars", "pres2"], ["vars", "pres3"],
                   ["sample", "1min"], ["what", "download"], ["tz", "UTC"], ["gis", "yes"], ["delim", "comma"]],
        "time_params": "sts_ets", "refresh": [3, 8, 36, 120]},
-      {"id": "iem-daily", "ver": "v1", "kind": "table", "enabled": true, "station_list": false,
+      {"id": "iem-daily", "ver": "v2", "kind": "table", "enabled": true, "station_list": false,
        "path": "/cgi-bin/request/daily.py", "networks": ["{ST}_ASOS"], "chunk": "month", "time_column": ["day"],
        "params": [["stations", "_ALL"], ["format", "csv"], ["na", "M"]],
        "time_params": "ymd", "refresh": [8, 36, 120]},
-      {"id": "iem-rwis", "ver": "v1", "kind": "table", "enabled": true, "station_list": false,
+      {"id": "iem-rwis", "ver": "v2", "kind": "table", "enabled": true, "station_list": false, "skip_empty_catalog": true,
        "path": "/cgi-bin/request/rwis.py", "networks": ["{ST}_RWIS"], "chunk": "month", "time_column": ["valid", "obtime"],
        "params": [["stations", "_ALL"], ["tz", "Etc/UTC"], ["delim", "comma"], ["gis", "yes"]],
        "time_params": "ymdhm", "refresh": [8, 36, 120]},
@@ -201,19 +219,22 @@
        "index": "https://www.nhc.noaa.gov/data/hurdat/", "pattern": "hurdat2-[A-Za-z0-9_.-]+\\.txt", "min_year": null},
       {"id": "nhc-atcf-btk", "ver": "v1", "kind": "listing", "enabled": true, "by_content": true,
        "index": "https://ftp.nhc.noaa.gov/atcf/btk/", "pattern": "b(?:al|ep|cp)\\d{2}(\\d{4})\\.dat", "min_year": 2021},
-      {"id": "spc-reports", "ver": "v1", "kind": "daily-files", "enabled": true,
+      {"id": "spc-reports", "ver": "v2", "kind": "daily-files", "enabled": true,
        "url": "https://www.spc.noaa.gov/climo/reports/{yymmdd}{suffix}",
-       "suffixes": ["_rpts_filtered.csv", "_rpts_raw_torn.csv", "_rpts_raw_wind.csv", "_rpts_raw_hail.csv"],
+       "suffixes": ["_rpts.csv", "_rpts_raw.csv", "_rpts_filtered.csv",
+                    "_rpts_filtered_torn.csv", "_rpts_filtered_wind.csv", "_rpts_filtered_hail.csv",
+                    "_rpts_raw_torn.csv", "_rpts_raw_wind.csv", "_rpts_raw_hail.csv"],
        "refresh": [8, 36, 120]},
       {"id": "nlcd-landcover", "ver": "v1", "kind": "static", "enabled": false, "pending": "source URL and size not yet read"}
     ]
   },
 
   "breaker": {
-    "total_days": 1855,
-    "fixed_gb_by_lane": {"noaa": 310.0, "iem": 803.0, "vtec": 851.3, "pilot": 0.0},
-    "cut_gb": 850.0,
-    "stop_gb": 900.0,
+    "note": "2.5 TB in total for every lane. Fixed tiers = the other lanes' expected footprint: grids ~1,620 GB (exact grids 1,551 + ProbSevere ~50 + sparse cubes), observations ~179 GB, warnings ~131 GB",
+    "total_days": 1866,
+    "fixed_gb_by_lane": {"noaa": 310.0, "iem": 1751.0, "vtec": 1799.0, "pilot": 0.0},
+    "cut_gb": 2400.0,
+    "stop_gb": 2500.0,
     "integrity_fail_share": 0.005,
     "day_fail_share": 0.01,
     "bytes_per_day_factor": 1.3,
@@ -230,9 +251,10 @@
 
   "cuts": [
     {"id": "webp", "enabled": false, "note": "only after a browser decode-back trial passes"},
-    {"id": "refl-15min", "enabled": true, "group": "mrms-refl", "set": {"cadence_min": 15}, "ver_suffix": "c2"},
-    {"id": "urma-wind-2h", "enabled": true, "group": "urma", "layers": ["urma-wind-u8", "urma-wdir-u8"],
-     "set": {"every_n_steps": 2}, "ver_suffix": "c3"},
+    {"id": "refl-15min", "enabled": false, "note": "off: every grid is kept at full cadence",
+     "group": "mrms-refl", "set": {"cadence_min": 15}, "ver_suffix": "c2"},
+    {"id": "urma-wind-2h", "enabled": false, "note": "off: every grid is kept at full cadence",
+     "group": "urma", "layers": ["urma-wind-x", "urma-wdir-x"], "set": {"every_n_steps": 2}, "ver_suffix": "c3"},
     {"id": "azshear", "enabled": false, "note": "not produced by this version"},
     {"id": "hads", "enabled": true, "iem_dataset": "iem-hads"},
     {"id": "coop", "enabled": true, "iem_dataset": "iem-coop"}

@@ -42,7 +42,9 @@ def test_pilot_iem_day(cfg, web, clock, s3, tmp_path, monkeypatch):
     flags = json.loads(s3.objects[by["boxflags-vtec"]["objects"][0]["key"]][0])
     assert flags["boxes"] == ["W097N34", "W099N34"]
     spc = by["spc-reports"]
-    assert spc["status"] == "complete" and len(spc["steps"]["missing"]) == 3  # 404s listed
+    # nine fixed SPC names per day; the fake serves one, the other eight 404s are listed
+    assert spc["status"] == "complete" and len(spc["steps"]["missing"]) == 8
+    assert spc["steps"]["expected"] == 9 and spc["ver"] == "v2"
     # NCEI listing keeps only files from the archive years
     ncei = [m for m in mans for d in m["datasets"] if d["id"] == "ncei-storm-events"]
     keys = [o["key"] for m in ncei for d in m["datasets"] if d["id"] == "ncei-storm-events" for o in d["objects"]]
@@ -90,7 +92,7 @@ def test_verify_lane_reports_and_orphans(cfg, web, clock, s3, tmp_path):
     cfg2 = dict(cfg)
     cfg2["other"] = {"datasets": []}
     lane_iem(ctx, DAY, DAY, "iem")
-    orphan = f"src/iem-asos/v1/2024/{DAY.isoformat()}/v20240101T0000Z/XX.parquet"
+    orphan = f"src/iem-asos/v2/2024/{DAY.isoformat()}/v20240101T0000Z/XX.parquet"
     s3.objects[orphan] = (b"x", None)
     vctx = make_ctx(cfg, web, clock, s3, tmp_path, lane="verify", job="verify-1", run_id="900")
     assert lane_verify(vctx, [DAY], check_all=True) == 0
@@ -103,3 +105,57 @@ def test_verify_lane_reports_and_orphans(cfg, web, clock, s3, tmp_path):
     s3.objects[key] = (data[:-1] + bytes([data[-1] ^ 1]), ct)
     vctx2 = make_ctx(cfg, web, clock, s3, tmp_path, lane="verify", job="verify-2", run_id="901")
     assert lane_verify(vctx2, [DAY], check_all=True) > 0
+
+
+def test_rwis_skips_empty_networks_and_no_results_body(cfg, web, clock, s3, tmp_path):
+    from conftest import catalog_geojson
+
+    def fn(url, p):
+        if p.path == "/geojson/network/NE_RWIS.geojson":
+            return 200, {}, catalog_geojson("NE_RWIS", n=0)
+        if p.path == "/cgi-bin/request/rwis.py" and "IA_RWIS" in p.query:
+            return 200, {}, b"Sorry, no results found for query!"
+        return None
+
+    web.route(fn)  # routes are tried in order: these before the generic fakes
+    add_iem(web)
+    cfg["iem"]["datasets"] = [d for d in cfg["iem"]["datasets"] if d["id"] in ("iem-stations", "iem-rwis")]
+    cfg["other"]["datasets"] = []
+    ctx = make_ctx(cfg, web, clock, s3, tmp_path, lane="iem", job="iem-r")
+    lane_iem(ctx, DAY, DAY, "iem")
+    rwis_calls = [u for u in web.urls() if "/rwis.py" in u]
+    assert len(rwis_calls) == 1 and "IA_RWIS" in rwis_calls[0]  # NE_RWIS lists no station: never requested
+    e = next(d for m in _mans(s3) for d in m["datasets"] if d["id"] == "iem-rwis")
+    assert e["ver"] == "v2" and e["status"] == "complete"
+    assert e["steps"] == {"expected": 1, "got": 1, "missing": []} and e["checks"]["empty"] == 1
+    assert e["objects"] == []  # the "no results" text is never stored
+
+
+def test_coverage_config():
+    from feeder import load_config
+
+    cfg = load_config()
+    states = cfg["iem"]["states"]
+    assert {"VI", "GU", "AS", "AK", "HI", "PR"} <= set(states) and len(states) == len(set(states)) == 54
+    spc = next(d for d in cfg["other"]["datasets"] if d["id"] == "spc-reports")
+    assert spc["ver"] == "v2" and set(spc["suffixes"]) == {
+        "_rpts.csv", "_rpts_raw.csv", "_rpts_filtered.csv", "_rpts_filtered_torn.csv", "_rpts_filtered_wind.csv",
+        "_rpts_filtered_hail.csv", "_rpts_raw_torn.csv", "_rpts_raw_wind.csv", "_rpts_raw_hail.csv"}
+    ps = next(g for g in cfg["noaa"]["groups"] if g["id"] == "probsevere")
+    assert ps["prefix"] == "ProbSevere/{ymd}/"
+    import re
+
+    assert re.search(ps["time_regex"], "ProbSevere/20240507/MRMS_PROBSEVERE_20240507_213640.json").groups() == \
+        ("20240507", "213640")
+
+
+def test_catalog_lane_runs_alone(cfg, web, clock, s3, tmp_path):
+    from feeder.run import lane_catalog
+
+    add_iem(web)
+    ctx = make_ctx(cfg, web, clock, s3, tmp_path, lane="catalog", job="catalog-x")
+    assert lane_catalog(ctx) is False
+    keys = sorted(k for k in s3.objects if k.startswith("src/"))
+    assert keys and all(k.startswith("src/iem-stations/v2/") for k in keys)
+    assert {k.rsplit("/", 1)[1].split("-")[0] for k in keys} == {"IA_ASOS", "NE_ASOS", "IA_RWIS", "NE_RWIS"}
+    assert not any(u for u in web.urls() if "/cgi-bin/" in u)

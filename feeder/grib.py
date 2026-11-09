@@ -1,5 +1,6 @@
-"""GRIB2: a pure-Python section walker (for files without an .idx) and pygrib decoding with parameter-id and
-grid-shape checks."""
+"""GRIB2: a pure-Python section walker (for files without an .idx), pygrib decoding with parameter-id and grid-shape
+checks, and the native-integer view of a decoded field (the packed integers and the R / E / D factors that rebuild the
+decoded values bit for bit)."""
 
 import struct
 
@@ -114,10 +115,60 @@ class Grid:
 
 
 class Field:
-    def __init__(self, values, grid, ids):
+    def __init__(self, values, grid, ids, packing=None):
         self.values = values
         self.grid = grid
         self.ids = ids
+        self.packing = packing  # {template, R, E, D, nbits, bitmap} or None when unknown
+
+
+# ---------------------------------------------------------------- native integers (exact storage)
+
+def power(base, n):
+    """base**n by repeated multiplication / division, the way the GRIB decoder builds its scale factors, so values
+    rebuilt from integers match the decoder's doubles bit for bit."""
+    out = 1.0
+    if n < 0:
+        for _ in range(-n):
+            out /= base
+    else:
+        for _ in range(n):
+            out *= base
+    return out
+
+
+def ints_to_values(ints, packing):
+    """Decoded value of each packed integer X: ((X * 2**E) + R) * 10**-D, in float64, as the decoder computes it."""
+    s = power(2.0, int(packing["E"]))
+    d = power(10.0, -int(packing["D"]))
+    return (np.asarray(ints, dtype=np.float64) * s + float(packing["R"])) * d
+
+
+def same_bits(a, b):
+    """True if two float64 arrays are identical bit for bit (NaN payloads and signed zeros included)."""
+    a = np.ascontiguousarray(a, dtype=np.float64)
+    b = np.ascontiguousarray(b, dtype=np.float64)
+    return a.shape == b.shape and np.array_equal(a.view(np.int64), b.view(np.int64))
+
+
+def values_to_ints(values, packing):
+    """The non-negative packed integers behind ``values`` (uint32), or None if they cannot be recovered exactly
+    (no packing description, a bitmap, a negative or out-of-range integer, or a value that the formula does not
+    reproduce bit for bit)."""
+    if not packing or packing.get("bitmap"):
+        return None
+    v = np.asarray(values, dtype=np.float64)
+    if not np.all(np.isfinite(v)):
+        return None
+    s = power(2.0, int(packing["E"]))
+    d = power(10.0, -int(packing["D"]))
+    x = np.rint((v / d - float(packing["R"])) / s)
+    if x.size and (x.min() < 0 or x.max() > 0xFFFFFFFF):
+        return None
+    ints = x.astype(np.uint32)
+    if not same_bits(ints_to_values(ints, packing), v):
+        return None
+    return ints
 
 
 def _pygrib():
@@ -182,7 +233,17 @@ def decode(message, field, expect_shape=None):
     if expect_shape is not None and tuple(vals.shape) != tuple(expect_shape):
         raise GribError(f"grid shape {vals.shape} != expected {tuple(expect_shape)}")
     ny, nx = vals.shape
+    packing = _packing(msg)
     sig = (msg["gridType"], ny, nx, round(float(msg["latitudeOfFirstGridPointInDegrees"]), 5),
            round(float(msg["longitudeOfFirstGridPointInDegrees"]), 5))
     grid = Grid(vals.shape, latlons_fn=msg.latlons, locate_fn=_make_locator(msg, ny, nx), signature=sig)
-    return Field(vals, grid, ids)
+    return Field(vals, grid, ids, packing)
+
+
+def _packing(msg):
+    try:
+        return {"template": int(msg["dataRepresentationTemplateNumber"]), "R": float(msg["referenceValue"]),
+                "E": int(msg["binaryScaleFactor"]), "D": int(msg["decimalScaleFactor"]),
+                "nbits": int(msg["bitsPerValue"]), "bitmap": bool(int(msg["bitmapPresent"]))}
+    except Exception:  # a key the decoder does not expose: exact storage falls back to the original message
+        return None

@@ -1,7 +1,10 @@
 """``feed-day/1`` manifests: one immutable JSON document per day per job.
 
 A manifest lists, for each dataset, every source (URL, byte range, sha256, ETag, Last-Modified, HTTP status, tries)
-and every stored object (key, bytes, sha256, MD5). It never holds an observation value or a statistic of one.
+and every stored object (key, bytes, sha256, MD5). An exact-grid object also carries, per step, the GRIB packing
+factors (template, R, E, D, bits) and the sha256 of its integers, of the decoded values and of the source bytes, so
+each step can be proven exact without opening the object. A gridded output that uses station cells carries the
+station map (station id, projected nearest cell, squared-degree nearest cell). No observation value or statistic of one is recorded.
 """
 
 import datetime as _dt
@@ -18,9 +21,10 @@ _B64MD5 = re.compile(r"^[A-Za-z0-9+/]{22}==$")
 _VINTAGE = re.compile(r"^v\d{8}T\d{4}Z$")
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RUN_FIELDS = ("id", "attempt", "job", "lane", "git_sha", "lock_sha256", "runner_image", "started_utc", "ended_utc")
-_CHECK_KEYS = {"roundtrip", "decode_back", "cells_checked", "rows", "station_points", "members", "note"}
+_CHECK_KEYS = {"roundtrip", "decode_back", "cells_checked", "rows", "station_points", "members", "note", "exact",
+               "max_quant_err", "exact_cells", "total_cells", "empty"}
 _SOURCE_KEYS = {"url", "range", "sha256", "etag", "last_modified", "valid_utc", "http", "tries", "fallback", "bytes"}
-_OBJECT_KEYS = {"key", "bytes", "sha256", "md5", "content_type", "status", "covers"}
+_OBJECT_KEYS = {"key", "bytes", "sha256", "md5", "content_type", "status", "covers", "exact"}
 
 
 def iso(ts):
@@ -44,28 +48,35 @@ class DatasetEntry(dict):
         self["sources"].append(s)
         return s
 
-    def add_object(self, put_result, covers=None):
+    def add_object(self, put_result, covers=None, exact=None):
         o = {k: put_result[k] for k in ("key", "bytes", "sha256", "md5", "content_type")}
         if covers:
             o["covers"] = covers
+        if exact:
+            o["exact"] = exact
         self["objects"].append(o)
         return o
 
-    def add_missing(self, valid_utc, http, tries):
-        self["steps"]["missing"].append({"valid_utc": valid_utc, "http": http, "tries": tries})
+    def add_missing(self, valid_utc, http, tries, known_gap=None):
+        """``known_gap``: None for sources where a 404 is a source gap; True / False for gridded sources under the
+        gap rule, where only a step on the configured known-gap list is explained."""
+        m = {"valid_utc": valid_utc, "http": http, "tries": tries}
+        if known_gap is not None:
+            m["known_gap"] = bool(known_gap)
+        self["steps"]["missing"].append(m)
 
     def finish_status(self):
-        """complete = every expected step was got or is a listed source 404 (a gap at the source);
-        partial = some step is missing for another reason (or a check failed); missing = nothing was got."""
+        """complete = every expected step was got or is explained (a known gap; or, outside the gap rule, a source
+        404); partial = some step is missing for another reason (or a check failed); missing = nothing was got."""
         if self["status"] == "unchanged":
             return self["status"]
         st = self["steps"]
-        other = [m for m in st["missing"] if m.get("http") != 404]
+        other = [m for m in st["missing"] if unexplained(m)]
         if st["expected"] and st["got"] == 0:
             self["status"] = "missing"
         elif other or (st["expected"] and st["got"] + len(st["missing"]) < st["expected"]):
             self["status"] = "partial"
-        elif any(v == "fail" for v in self["checks"].values() if isinstance(v, str)):
+        elif any(v in ("fail", "unavailable") for v in self["checks"].values() if isinstance(v, str)):
             self["status"] = "partial"
         else:
             self["status"] = "complete"
@@ -94,6 +105,13 @@ class DayManifest:
         if errs:
             raise ValueError("manifest invalid: " + "; ".join(errs[:5]))
         return canonical_json(doc)
+
+
+def unexplained(m):
+    """A missing step that is not a known source gap. Under the gap rule (``known_gap`` present) a 404 counts too."""
+    if "known_gap" in m:
+        return not m["known_gap"]
+    return m.get("http") != 404
 
 
 def manifest_sha256(doc):

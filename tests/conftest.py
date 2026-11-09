@@ -82,16 +82,28 @@ class FakeWeb:
 
 # ---------------------------------------------------------------- fake GRIB
 
-def fake_message(ids, values):
-    head = json.dumps({"ids": list(ids), "shape": list(values.shape)}).encode()
-    return b"FAKEGRIB" + len(head).to_bytes(4, "big") + head + np.asarray(values, np.float64).tobytes()
+def fake_message(ids, values, pack=None):
+    """A fake message. With ``pack`` ({R, E, D}) it carries packed integers like a real GRIB2 message and decodes to
+    ((X * 2**E) + R) * 10**-D; without it, plain float64 values and no packing description."""
+    head = {"ids": list(ids), "shape": list(values.shape)}
+    if pack is not None:
+        v = np.asarray(values, np.float64)
+        s, d = grib.power(2.0, pack["E"]), grib.power(10.0, -pack["D"])
+        x = np.rint((v / d - pack["R"]) / s)
+        head["pack"] = {"template": 0, "R": float(pack["R"]), "E": int(pack["E"]), "D": int(pack["D"]),
+                        "nbits": 16, "bitmap": False}
+        payload = x.astype("<u4").tobytes()
+    else:
+        payload = np.asarray(values, np.float64).tobytes()
+    h = json.dumps(head).encode()
+    return b"FAKEGRIB" + len(h).to_bytes(4, "big") + h + payload
 
 
-def grib2_message(ids, values, surface=(103, 10)):
+def grib2_message(ids, values, pack=None, surface=(103, 10)):
     """A structurally valid GRIB2 message (sections 0-7) whose section 7 carries a fake payload."""
     import struct
 
-    payload = fake_message(ids, values)
+    payload = fake_message(ids, values, pack)
     s1 = struct.pack(">IB", 21, 1) + bytes(16)
     s3 = struct.pack(">IB", 72, 3) + bytes(1) + struct.pack(">I", values.size) + bytes(2) + struct.pack(">H", 30) + \
         bytes(58)
@@ -123,12 +135,17 @@ def fake_decode(message, field, expect_shape=None):
         raise grib.GribError("not fake grib")
     n = int.from_bytes(b[8:12], "big")
     head = json.loads(b[12:12 + n])
-    vals = np.frombuffer(b[12 + n:], np.float64).reshape(head["shape"]).copy()
+    pack = head.get("pack")
+    if pack is not None:
+        x = np.frombuffer(b[12 + n:], "<u4").reshape(head["shape"])
+        vals = grib.ints_to_values(x, pack)
+    else:
+        vals = np.frombuffer(b[12 + n:], np.float64).reshape(head["shape"]).copy()
     if field.get("grib") is not None and tuple(head["ids"]) != tuple(field["grib"]):
         raise grib.GribError("ids")
     if expect_shape is not None and vals.shape != tuple(expect_shape):
         raise grib.GribError("shape")
-    return grib.Field(vals, grib.Grid(vals.shape, _latlons, _locate, ("fake", NY, NX)), tuple(head["ids"]))
+    return grib.Field(vals, grib.Grid(vals.shape, _latlons, _locate, ("fake", NY, NX)), tuple(head["ids"]), pack)
 
 
 def urma_field(name, hour, seed=0):
@@ -142,7 +159,10 @@ def urma_field(name, hour, seed=0):
     return np.round(rng.uniform(0, 360, (NY, NX)), 1)
 
 
-def add_urma(web, day=DAY, seed=0, missing_hours=(), no_idx=False):
+URMA_PACK = {"gust": {"R": 0.0, "E": 0, "D": 2}, "wind": {"R": 0.0, "E": 0, "D": 2}, "wdir": {"R": 0.0, "E": 0, "D": 1}}
+
+
+def add_urma(web, day=DAY, seed=0, missing_hours=(), no_idx=False, packed=True):
     ids = {"gust": (0, 2, 22), "wind": (0, 2, 1), "wdir": (0, 2, 0)}
     names = {"gust": "GUST:10 m above ground:anl", "wind": "WIND:10 m above ground:anl",
              "wdir": "WDIR:10 m above ground:anl"}
@@ -153,7 +173,8 @@ def add_urma(web, day=DAY, seed=0, missing_hours=(), no_idx=False):
         url = f"https://noaa-urma-pds.s3.amazonaws.com/{key}"
         body, idx, off = b"", [], 0
         for n, f in enumerate(("gust", "wind", "wdir"), start=1):
-            m = (grib2_message if no_idx else fake_message)(ids[f], urma_field(f, h, seed))
+            m = (grib2_message if no_idx else fake_message)(ids[f], urma_field(f, h, seed),
+                                                            URMA_PACK[f] if packed else None)
             idx.append(f"{n}:{off}:d={day:%Y%m%d}{h:02d}:{names[f]}:")
             body += m
             off += len(m)
@@ -163,6 +184,15 @@ def add_urma(web, day=DAY, seed=0, missing_hours=(), no_idx=False):
 
 
 # ---------------------------------------------------------------- IEM fakes
+
+CATALOG_KEY = "src/iem-stations/v2/2024/2024-04-01/v20240401T1113Z/IA_ASOS-0123456789abcdef.geojson.zst"
+
+
+def seed_catalog(s3, net="IA_ASOS", n=3):
+    """A stored station catalogue, as the catalogue job leaves it before the gridded lane runs."""
+    from feeder import compact
+
+    s3.objects[CATALOG_KEY.replace("IA_ASOS", net)] = (compact.zstd(catalog_geojson(net, n)), "application/zstd")
 
 def catalog_geojson(net, n=3):
     feats = [{"type": "Feature", "id": f"{net[:2]}{k}", "properties": {"sid": f"{net[:2]}{k}"},
@@ -312,12 +342,14 @@ def s3():
 
 
 def make_ctx(cfg, web, clock, s3, tmp_path, write=True, lane="noaa", job="job", started=STARTED, groups=None,
-             run_id="100", s3_online=True):
+             run_id="100", s3_online=True, catalog=True):
     if groups is not None:
         cfg = copy.deepcopy(cfg)
         cfg["noaa"]["groups"] = [g for g in cfg["noaa"]["groups"] if g["id"] in groups]
     http = Http(cfg, transport=web, sleep=clock.sleep, clock=clock,
                 wallclock=lambda: _dt.datetime(2024, 4, 20, 12, 0, tzinfo=_dt.timezone.utc))
+    if catalog and lane == "noaa" and not any(k.startswith("src/iem-stations/") for k in s3.objects):
+        seed_catalog(s3)
     store = Store(s3 if s3_online else None, "bucket", write=write)
     import os
 

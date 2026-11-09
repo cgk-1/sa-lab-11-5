@@ -95,3 +95,53 @@ def test_iem_asos_one_station_one_day(http, outdir):
     assert compact.roundtrip_ok([p], r.sha256)
     print("smoke iem:", f"bytes={len(r.body)}", f"rows={t.num_rows}", f"parquet_bytes={len(p)}",
           f"columns={len(t.column_names) - 1}")
+
+
+@pytest.mark.parametrize("group_id,field,when", [
+    ("urma", "gust", _dt.datetime(2024, 5, 7, 21, tzinfo=_dt.timezone.utc)),       # 5.0 simple, 0.01 m/s
+    ("hrrr", "gust", _dt.datetime(2024, 5, 7, 20, tzinfo=_dt.timezone.utc)),       # 5.3 complex, 1/16 m/s
+    ("hrrr", "u10", _dt.datetime(2024, 5, 7, 20, tzinfo=_dt.timezone.utc)),        # 5.0 simple, 1/16 m/s
+    ("rtma-ru", "gust", _dt.datetime(2024, 5, 7, 21, 15, tzinfo=_dt.timezone.utc)),  # 5.0 simple, 0.01 m/s
+])
+def test_exact_decode_back_real_message(http, group_id, field, when, tmp_path):
+    """One real message fetched by byte range: its packed integers rebuild the decoder's float64 values bit for bit,
+    and the exact-grid object built from it passes the decode-back check."""
+    from feeder import exact
+
+    cfg = load_config()
+    group = next(g for g in cfg["noaa"]["groups"] if g["id"] == group_id)
+    url = noaa.nodd_url(group["bucket"], noaa.fill(group["key"], when))
+    e = noaa.find_entry(noaa.parse_idx(http.get(url + group["idx_suffix"]).body.decode("ascii")),
+                        group["fields"][field]["idx"])
+    body = http.get(url, rng=(e.offset, e.end)).body
+    assert len(body) < 8_000_000
+    fld = grib.decode(body, group["fields"][field])
+    ints = grib.values_to_ints(fld.values, fld.packing)
+    assert ints is not None and grib.same_bits(grib.ints_to_values(ints, fld.packing), fld.values)
+    cube = exact.ExactCube(fld.values.shape, 1, str(tmp_path), 128, "dxy", 19, "auto", 4)
+    rec = cube.add_step(0, noaa.iso(when), fld.values, fld.packing, body)
+    data = cube.to_bytes({})
+    cube.close()
+    ok, rep = exact.verify(data, grib.decode, {"grib": group["fields"][field]["grib"]})
+    assert ok and rep["checked"] == 1
+    print("exact", group_id, field, fld.packing, rec["mode"], f"source={len(body)}", f"object={len(data)}")
+
+
+def test_exact_decode_back_real_reflectivity(http, tmp_path):
+    import gzip
+
+    from feeder import exact
+
+    cfg = load_config()
+    group = next(g for g in cfg["noaa"]["groups"] if g["id"] == "mrms-refl")
+    day = _dt.date(2024, 5, 7)
+    keys = noaa.list_keys(http, group["bucket"], noaa.fill(group["prefix"], noaa.day_steps(day, 1440)[0]))
+    key = next(k["key"] for k in keys if k["key"].endswith("-200039.grib2.gz") or "-2000" in k["key"])
+    r = http.get(noaa.nodd_url(group["bucket"], key))
+    fld = grib.decode(gzip.decompress(r.body), {"grib": None})
+    cube = exact.ExactCube(fld.values.shape, 1, str(tmp_path), 128, "raw", 19, "auto", 4)
+    rec = cube.add_step(0, key, fld.values, fld.packing, r.body, "gzip")
+    data = cube.to_bytes({})
+    cube.close()
+    assert rec["int_exact"] and exact.verify(data, grib.decode)[0]
+    print("exact refl", fld.packing, rec["mode"], f"source={len(r.body)}", f"object={len(data)}")

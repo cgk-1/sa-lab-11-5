@@ -70,7 +70,8 @@ def test_size_projection_applies_cuts_then_stops(bcfg):
     for _ in range(3):
         b.after_day(DAY, per_day, False)
     b.check_before_day()
-    assert [c["id"] for c in b.active_cuts()] == ["refl-15min"]
+    # the grid cuts are off (every grid at full cadence): the first enabled cut is a pending observation dataset
+    assert [c["id"] for c in b.active_cuts()] == ["hads"]
     b.check_before_day()  # needs more days before the next cut
     assert len(b.active_cuts()) == 1
     enabled = [c for c in cuts if c.get("enabled")]
@@ -80,6 +81,18 @@ def test_size_projection_applies_cuts_then_stops(bcfg):
             b.after_day(DAY, huge, False)
             b.check_before_day()
     assert len(b.active_cuts()) == len(enabled) and "size" in e.value.reason
+    assert not {"refl-15min", "urma-wind-2h"} & {c["id"] for c in b.active_cuts()}
+
+
+def test_caps_for_two_and_a_half_tb(bcfg):
+    cfg, cuts = bcfg
+    assert cfg["stop_gb"] == 2500.0 and cfg["cut_gb"] < cfg["stop_gb"]
+    assert {c["id"]: c["enabled"] for c in cuts}["refl-15min"] is False
+    assert {c["id"]: c["enabled"] for c in cuts}["urma-wind-2h"] is False
+    # every lane's projection carries the other lanes' footprint; all lanes together stay inside the cap
+    fixed = cfg["fixed_gb_by_lane"]
+    grids = fixed["iem"] + fixed["vtec"] - fixed["noaa"]  # = 2 x grids + iem + vtec - (iem + vtec)
+    assert abs(grids / 2 + fixed["noaa"] - 1930.0) < 1.0
 
 
 def test_bytes_per_day_streak_stops_job(bcfg):

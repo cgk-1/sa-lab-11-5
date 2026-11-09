@@ -56,7 +56,7 @@ def test_refresh_unchanged_then_changed(cfg, web, clock, s3, tmp_path):
     later3 = STARTED + _dt.timedelta(days=2)
     ctx3 = make_ctx(cfg, web3, clock, s3, tmp_path, lane="iem", job="daily-iem", started=later3, run_id="300")
     daily_iem(ctx3, target, [8], 0)
-    new_asos = [k for k in s3.objects if k not in before and k.startswith(f"src/iem-asos/v1/2024/{DAY.isoformat()}/")]
+    new_asos = [k for k in s3.objects if k not in before and k.startswith(f"src/iem-asos/v2/2024/{DAY.isoformat()}/")]
     assert new_asos and all("/v20240422T1207Z/" in k for k in new_asos)
     for k, v in before.items():
         assert s3.objects[k] == v

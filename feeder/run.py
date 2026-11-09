@@ -1,6 +1,6 @@
 """Lane entry point for manual runs: ``python -m feeder.run``.
 
-Environment: LANE (noaa | iem | vtec | verify), CHUNK (YYYY-MM-DD..YYYY-MM-DD), RUN_KIND (the dispatched lane:
+Environment: LANE (catalog | noaa | iem | vtec | verify; catalog needs no CHUNK), CHUNK (YYYY-MM-DD..YYYY-MM-DD), RUN_KIND (the dispatched lane:
 pilot | vtec | noaa | iem | verify), WRITE (true / false; false = dry run: fetch, build and check, upload nothing,
 print the manifests), CONTACT_EMAIL, and the storage secrets S3_ENDPOINT / S3_BUCKET / S3_KEY_ID / S3_SECRET.
 """
@@ -71,13 +71,25 @@ class Ctx:
     def within_budget(self):
         return time.monotonic() < self._deadline
 
+    def station_catalog_id(self):
+        ds = iem.catalog_dataset(self.cfg)
+        return f"{ds['id']}/{ds['ver']}"
+
     def station_points(self):
+        """[(station id, lat, lon)] from the stored catalogue (read live in a dry run without storage), or None."""
         if self._points == "unset":
+            ds = iem.catalog_dataset(self.cfg)
             try:
-                self._points = iem.station_points_from_store(self.store)
+                if self.store.online:
+                    self._points = iem.station_points_from_store(self.store, f"src/{ds['id']}/{ds['ver']}/")
+                else:
+                    self._points = iem.station_points_live(self)
             except Exception as err:
                 log("station-points", "unavailable", type(err).__name__)
                 self._points = None
+            if not self._points:
+                self._points = None
+                log("station-points", "unavailable", "no catalogue")
         return self._points
 
     def close(self):
@@ -264,7 +276,7 @@ def lane_iem(ctx, start, end, kind):
         if ds["kind"] == "catalog":
             catalogs = iem.run_catalog(ctx, book, ds, today)
         elif ds["kind"] == "table":
-            if ds.get("station_list") and not catalogs:
+            if (ds.get("station_list") or ds.get("skip_empty_catalog")) and not catalogs:
                 cat = next(c for c in ctx.cfg["iem"]["datasets"] if c["kind"] == "catalog")
                 catalogs = iem.run_catalog(ctx, book, cat, today)
             iem.run_table(ctx, book, ds, start, end, ds.get("chunk", "day") if chunked else "day", catalogs, skip)
@@ -284,10 +296,20 @@ def lane_iem(ctx, start, end, kind):
         finish_day(ctx, book, day, kind == "pilot")
 
 
+def lane_catalog(ctx):
+    """Station catalogues only; runs before the gridded and observation lanes, which read it."""
+    book = Book(ctx)
+    iem.run_catalog(ctx, book, iem.catalog_dataset(ctx.cfg), utcnow().date())
+    failed = False
+    for day in book.days():
+        failed = finish_day(ctx, book, day, False) or failed
+    return failed
+
+
 def verify_datasets(cfg):
     out = []
     for g in cfg["noaa"]["groups"]:
-        for o in g["outputs"]:
+        for o in noaa.active_outputs(g):
             if o["kind"] == "tile":
                 out.append((o["layer"], o["ver"], "tile"))
                 out.extend((ov["layer"], o["ver"], "tile") for ov in o.get("overviews", []))
@@ -330,12 +352,16 @@ def main(env=None):
     env = env if env is not None else os.environ
     lane = env.get("LANE", "")
     kind = env.get("RUN_KIND", lane)
-    try:
-        start, end = parse_chunk(env.get("CHUNK", ""))
-    except (ValueError, AttributeError):
-        print("run: CHUNK must be YYYY-MM-DD..YYYY-MM-DD", file=sys.stderr)
-        return 2
-    if lane not in ("noaa", "iem", "vtec", "verify"):
+    if lane == "catalog" and not env.get("CHUNK"):
+        today = utcnow().date()
+        start = end = today
+    else:
+        try:
+            start, end = parse_chunk(env.get("CHUNK", ""))
+        except (ValueError, AttributeError):
+            print("run: CHUNK must be YYYY-MM-DD..YYYY-MM-DD", file=sys.stderr)
+            return 2
+    if lane not in ("noaa", "iem", "vtec", "verify", "catalog"):
         print("run: unknown LANE", file=sys.stderr)
         return 2
     cfg = load_config()
@@ -352,6 +378,8 @@ def main(env=None):
             lane_noaa(ctx, start, end, pilot=(kind == "pilot"))
         elif lane in ("iem", "vtec"):
             lane_iem(ctx, start, end, "pilot" if kind == "pilot" else lane)
+        elif lane == "catalog":
+            code = 1 if lane_catalog(ctx) else 0
         else:
             code = 1 if lane_verify(ctx, list(_days(start, end))) else 0
     except BreakerTripped as tr:

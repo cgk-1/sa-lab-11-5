@@ -152,9 +152,9 @@ def test_parse_idx():
 
 
 def test_sparse_cube_rejects_out_of_range():
-    c = sparse.SparseCube((2, 2), 1, 15.0, 0, [])
+    c = sparse.SparseCube((2, 2), 1, 15.0, 1, [])  # lattice step 1: every cell kept
     with pytest.raises(ValueError):
-        c.add_step(0, np.array([[700.0, 1.0], [1.0, 1.0]]))
+        c.add_step(0, np.array([[-700.0, 1.0], [1.0, 1.0]]))  # below the packed-integer range
 
 
 # ---------------------------------------------------------------- boxes

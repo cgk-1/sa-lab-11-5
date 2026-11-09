@@ -28,10 +28,37 @@ defaults:
     shell: bash --noprofile --norc -euo pipefail {0}
 
 jobs:
-  noaa:
+  catalog:
+    # Station catalogues first: the gridded lane reads them for its station cells.
     runs-on: ubuntu-24.04
     environment: daily
-    timeout-minutes: 90
+    timeout-minutes: 30
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Station catalogues
+        env:
+          LANE: catalog
+          WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.run
+
+  noaa:
+    needs: catalog
+    runs-on: ubuntu-24.04
+    environment: daily
+    timeout-minutes: 120
     steps:
       - name: Get this commit
         run: |
@@ -57,6 +84,7 @@ jobs:
         run: cd code && ../.venv/bin/python -E -m feeder.daily
 
   iem:
+    needs: catalog
     runs-on: ubuntu-24.04
     environment: daily
     timeout-minutes: 120

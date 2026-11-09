@@ -12,7 +12,8 @@ Rules:
   enabled cut is applied to days not yet written (one cut per ``size_min_days`` days); above ``stop_gb`` with no cut
   left, the run stops. A job stops when its bytes per day exceed ``bytes_per_day_factor`` x the expected rate on
   ``bytes_per_day_streak`` days in a row;
-- gaps: a gridded day with more than ``gap_unexplained_max`` missing steps that are not a source 404 fails;
+- gaps: a gridded day with more than ``gap_unexplained_max`` unexplained missing steps fails; under the gap rule a
+  source 404 is unexplained too unless the step is on the group's ``known_gaps`` list;
 - observation lane: repeated 429 / 503 bursts pause the lane; more than 5 % failed requests stop it;
 - prefixes: a key outside the archive prefixes (store.PrefixError) stops the run.
 """
@@ -20,6 +21,7 @@ Rules:
 import json
 
 from . import canonical_json, log, utcnow
+from .manifest import unexplained
 from .store import run_key
 
 
@@ -162,8 +164,7 @@ class Breaker:
                           f"{self.streak} days in a row", scope="job")
 
     def gap_failed(self, missing):
-        unexplained = [m for m in missing if m.get("http") != 404]
-        return len(unexplained) > int(self.cfg["gap_unexplained_max"])
+        return len([m for m in missing if unexplained(m)]) > int(self.cfg["gap_unexplained_max"])
 
     def observe_http(self, http):
         """Observation-lane politeness: pause after repeated bursts; stop when too many requests fail."""

@@ -1,6 +1,7 @@
 """NOAA Open Data Dissemination (AWS) sources: .idx lookup, GRIB2 header walk when there is no .idx, byte-range
-reads, S3 listing, ETag / Last-Modified capture; and the per-day processing of one source group into sparse cubes,
-display tiles, as-served bundles and box flags."""
+reads, S3 listing, ETag / Last-Modified capture; and the per-day processing of one source group into exact grids
+(every cell, source precision), sparse cubes, as-served bundles, box flags and (optional, off by default) u8 display
+tiles."""
 
 import concurrent.futures as cf
 import copy
@@ -13,7 +14,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from . import canonical_json, compact, grib, log, sparse, stormbox, tile
+from . import canonical_json, compact, exact, grib, log, sparse, stormbox, tile, utcnow
 from .net import HttpError
 from .manifest import DatasetEntry, iso
 from .store import src_key, tile_key
@@ -170,14 +171,20 @@ def fetch_grib_step(http, group, fields, when):
 
 # ---------------------------------------------------------------- cuts
 
+def active_outputs(group):
+    """The group's outputs that are switched on (``enabled`` defaults to true; display tiles default to off)."""
+    return [o for o in group["outputs"] if o.get("enabled", True)]
+
+
 def apply_cuts(group, cuts):
     g = copy.deepcopy(group)
+    g["outputs"] = active_outputs(g)
     for c in cuts:
         if c.get("group") != g["id"]:
             continue
         layers = c.get("layers")
         for o in g["outputs"]:
-            if layers is None or o.get("layer") in layers:
+            if layers is None or output_id(o) in layers:
                 o["ver"] = f"{o['ver'].split('-')[0]}-{c['ver_suffix']}"
                 if "every_n_steps" in c.get("set", {}):
                     o["every_n_steps"] = c["set"]["every_n_steps"]
@@ -218,9 +225,9 @@ def _era(group, day):
     return [e["flag"] for e in group.get("era", []) if day.isoformat() < e["before"]]
 
 
-def _put(ctx, res, entry, key, data, ctype, covers=None):
+def _put(ctx, res, entry, key, data, ctype, covers=None, exact=None):
     pr = ctx.store.put(key, data, ctype)
-    entry.add_object(pr, covers)
+    entry.add_object(pr, covers, exact)
     res.written.append((pr, data))
     res.bytes += pr["bytes"]
     return pr
@@ -283,6 +290,11 @@ def process_group(ctx, group, day, outputs, supersedes=None):
         e.finish_status()
         if e["checks"].get("decode_back") == "fail" or e["checks"].get("roundtrip") == "fail":
             e["status"] = "partial"
+        if e["checks"].get("station_points") == "unavailable":
+            # station cells were wanted but the station catalogue was not readable: never "complete"
+            e["status"] = "partial" if e["status"] == "complete" else e["status"]
+            res.failed = True
+            res.reasons.append(f"station points unavailable: {e['id']}")
     return res
 
 
@@ -293,17 +305,67 @@ def _new_entry(ctx, o, group, day, supersedes):
     return e
 
 
-def _station_cells(ctx, grid):
-    pts = ctx.station_points()
-    if pts is None:
-        return None
-    return [grid.locate(lat, lon) for lat, lon in pts]
+def station_map(grid, points, window=6):
+    """[[station id, nearest cell, degree cell]] for ``points`` [(id, lat, lon)].
+
+    nearest = the grid point nearest in the grid's own projection; degree cell = the minimum of
+    (lat - lat0)**2 + (lon - lon0)**2 over the grid's float64 latitude/longitude arrays (a common lookup that can
+    differ from the projected nearest point), searched around the nearest point and widened while the minimum sits
+    on the search window's edge.
+    Stations outside the grid get [id, None, None]."""
+    lats, lons = grid.latlons()
+    ny, nx = grid.shape
+    out = []
+    for sid, lat, lon in points:
+        c = grid.locate(lat, lon)
+        if c is None:
+            out.append([sid, None, None])
+            continue
+        j, i = divmod(int(c), nx)
+        w = window
+        while True:
+            j0, j1, i0, i1 = max(0, j - w), min(ny, j + w + 1), max(0, i - w), min(nx, i + w + 1)
+            d = (lats[j0:j1, i0:i1] - lat) ** 2 + (lons[j0:j1, i0:i1] - lon) ** 2
+            k = int(np.argmin(d))
+            jj, ii = divmod(k, i1 - i0)
+            edge = (jj == 0 and j0 > 0) or (jj == j1 - j0 - 1 and j1 < ny) or (ii == 0 and i0 > 0) or \
+                (ii == i1 - i0 - 1 and i1 < nx)
+            if not edge or (j0 == 0 and i0 == 0 and j1 == ny and i1 == nx):
+                break
+            w *= 4
+        out.append([sid, int(c), (j0 + jj) * nx + (i0 + ii)])
+    return out
+
+
+def halo_cells(cells, shape, r=1):
+    """Every cell within ``r`` rows/columns of each cell (a (2r+1) x (2r+1) block, clipped at the grid edge)."""
+    ny, nx = shape
+    out = set()
+    for c in cells:
+        if c is None:
+            continue
+        j, i = divmod(int(c), nx)
+        for dj in range(-r, r + 1):
+            for di in range(-r, r + 1):
+                if 0 <= j + dj < ny and 0 <= i + di < nx:
+                    out.add((j + dj) * nx + i + di)
+    return sorted(out)
+
+
+def _station_map(ctx, grid, cache):
+    """The day's station map for ``grid`` (computed once per group), or None without a station catalogue."""
+    if "map" not in cache:
+        pts = ctx.station_points()
+        cache["map"] = None if pts is None else station_map(grid, pts)
+    return cache["map"]
 
 
 def _init_outputs(ctx, group, day, outputs, n_steps, grid, supersedes, res):
     outs = []
     for o in outputs:
         e = _new_entry(ctx, o, group, day, supersedes)
+        if o.get("station_points"):
+            e["station_map"] = None
         res.entries.append(e)
         every = int(o.get("every_n_steps", 1))
         used = [i for i in range(n_steps) if i % every == 0]
@@ -312,7 +374,27 @@ def _init_outputs(ctx, group, day, outputs, n_steps, grid, supersedes, res):
     return outs
 
 
-def _feed(ctx, outs, field_key, i, values, grid, n_steps, cubes):
+def _attach_station_map(ctx, out, grid, smap_cache):
+    smap = _station_map(ctx, grid, smap_cache)
+    if smap is None:
+        out.entry["checks"]["station_points"] = "unavailable"
+        return None
+    out.entry["checks"]["station_points"] = len([m for m in smap if m[1] is not None])
+    if "on" in smap_cache:
+        # the group's first station output carries the map; the others point to it (same grid, same catalogue)
+        out.entry["station_map"] = {"same_as": smap_cache["on"]}
+    else:
+        smap_cache["on"] = output_id(out.spec)
+        out.entry["station_map"] = {"catalog": ctx.station_catalog_id(), "rule": "nearest = projected grid point; "
+                                    "degree = min (lat-lat0)^2 + (lon-lon0)^2 over the float64 grid lat/lon",
+                                    "stations": smap}
+    return smap
+
+
+def _feed(ctx, outs, field_key, i, fld, grid, n_steps, cubes, label=None, source=None, source_encoding="none",
+          smap_cache=None):
+    values = fld.values
+    smap_cache = {} if smap_cache is None else smap_cache
     for out in outs:
         o = out.spec
         if (o.get("field") or o.get("product")) != field_key:
@@ -320,14 +402,26 @@ def _feed(ctx, outs, field_key, i, values, grid, n_steps, cubes):
         if i not in out.steps_used:
             continue
         k = id(out)
-        if o["kind"] == "sparse":
+        if o["kind"] == "exact":
             if k not in cubes:
-                cells = _station_cells(ctx, grid) if o.get("station_points") else None
+                xc = ctx.cfg.get("exact", {})
+                cubes[k] = exact.ExactCube(values.shape, n_steps, ctx.staging, int(o.get("tile_size", xc.get(
+                    "tile_size", 128))), o.get("predictor", "dxy"), int(o.get("zstd_level", xc.get("zstd_level", 19))),
+                    o.get("store", "auto"), int(xc.get("workers", 4)))
+                if o.get("station_points"):
+                    _attach_station_map(ctx, out, grid, smap_cache)
+            cubes[k].add_step(i, label, values, fld.packing, source, source_encoding)
+        elif o["kind"] == "sparse":
+            if k not in cubes:
+                points, deg = None, None
+                if o.get("station_points"):
+                    smap = _attach_station_map(ctx, out, grid, smap_cache)
+                    if smap is not None:
+                        points = halo_cells([m[1] for m in smap], values.shape, int(o.get("halo", 1)))
+                        deg = [m[2] for m in smap]
                 cubes[k] = sparse.SparseCube(values.shape, n_steps, o["threshold_mph"] / sparse.MPH_PER_MS,
-                                             o.get("lattice_step", 10), cells)
-                out.entry["checks"]["station_points"] = len([c for c in cells if c is not None]) \
-                    if cells is not None else "unavailable"
-            cubes[k].add_step(i, values)
+                                             o.get("lattice_step", 10), points, deg, exact=o.get("exact", True))
+            cubes[k].add_step(i, values, fld.packing)
         elif o["kind"] == "tile":
             if k not in cubes:
                 enc = tile.Encoding(ctx.cfg["encodings"][o["enc"]])
@@ -343,12 +437,33 @@ def _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, step_labels):
     for out in outs:
         o = out.spec
         k = id(out)
-        if o["kind"] == "sparse" and k in cubes:
+        if o["kind"] == "exact" and k in cubes:
+            cube = cubes[k]
+            for m in out.entry["steps"]["missing"]:
+                if m["valid_utc"] in step_labels:
+                    cube.add_missing(step_labels.index(m["valid_utc"]), m["valid_utc"])
+            meta = {"dataset": o["dataset"], "day": day.isoformat(), "source_group": group["id"],
+                    "field": o.get("field") or o.get("product"),
+                    "grid": list(grid.signature) if grid is not None and grid.signature else None,
+                    "step_labels": step_labels}
+            data = cube.to_bytes(meta)
+            hdr = exact.ExactReader.from_bytes(data).header
+            field = group.get("fields", {}).get(o.get("field"), {"grib": None})
+            ok, rep = exact.verify(data, ctx.decode, {"grib": field.get("grib")})
+            out.entry["checks"].update({"decode_back": "pass" if ok else "fail", "exact": cube.summary(),
+                                        "cells_checked": rep["checked"] * cube.shape[0] * cube.shape[1]})
+            _put(ctx, res, out.entry, src_key(o["dataset"], o["ver"], day, ctx.vintage, f"{o['dataset']}-{ymd}.xgrid"),
+                 data, "application/octet-stream", exact=exact.manifest_record(hdr))
+            cube.close()
+            if not ok:
+                res.failed = True
+                res.reasons.append(f"exact decode-back failed: {o['dataset']} steps={rep['failed'][:5]}")
+        elif o["kind"] == "sparse" and k in cubes:
             cube = cubes[k]
             data, rows = cube.to_parquet({"dataset": o["dataset"], "day": day.isoformat(), "field": o["field"],
                                           "step_labels": step_labels, "unit": "m/s"})
             ok = sparse.decode_check(data, cube)
-            out.entry["checks"].update({"decode_back": "pass" if ok else "fail", "rows": rows})
+            out.entry["checks"].update({"decode_back": "pass" if ok else "fail", "rows": rows, **cube.checks()})
             _put(ctx, res, out.entry, src_key(o["dataset"], o["ver"], day, ctx.vintage, f"{o['dataset']}-{ymd}.parquet"),
                  data, "application/vnd.apache.parquet")
             if not ok:
@@ -387,7 +502,9 @@ def _process_grib(ctx, group, day, outputs, supersedes, res):
     with cf.ThreadPoolExecutor(max_workers=NODD_WORKERS) as pool:
         fetched = list(pool.map(lambda w: fetch_grib_step(ctx.http, group, fields, w), steps))
     outs = _init_outputs(ctx, group, day, outputs, len(steps), None, supersedes, res)
-    cubes, grid, shape = {}, None, None
+    known = set(group.get("known_gaps", []))
+    strict = bool(group.get("gap_rule"))
+    cubes, grid, shape, smap = {}, None, None, {}
     for i, when in enumerate(steps):
         valid = iso(when + off)
         for fname in fields:
@@ -395,7 +512,7 @@ def _process_grib(ctx, group, day, outputs, supersedes, res):
             if r is None:
                 for out in outs:
                     if out.spec["field"] == fname and i in out.steps_used:
-                        out.entry.add_missing(valid, st, tries)
+                        out.entry.add_missing(valid, st, tries, known_gap=(iso(when) in known) if strict else None)
                 continue
             src = r.source_record(valid_utc=valid, fallback=fb)
             for out in outs:
@@ -404,7 +521,7 @@ def _process_grib(ctx, group, day, outputs, supersedes, res):
             fld = ctx.decode(r.body, group["fields"][fname], shape)
             if shape is None:
                 shape, grid = fld.values.shape, fld.grid
-            _feed(ctx, outs, fname, i, fld.values, grid, len(steps), cubes)
+            _feed(ctx, outs, fname, i, fld, grid, len(steps), cubes, label=valid, source=r.body, smap_cache=smap)
             fetched[i][fname] = None  # release the bytes
     labels = [iso(w + off) for w in steps]
     _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, labels)
@@ -461,7 +578,8 @@ def _process_files(ctx, group, day, outputs, supersedes, res):
             fld = ctx.decode(gzip.decompress(r.body), {"grib": None}, shape)
             if shape is None:
                 shape, grid = fld.values.shape, fld.grid
-            _feed(ctx, other, prod, i, fld.values, grid, len(steps), cubes)
+            _feed(ctx, other, prod, i, fld, grid, len(steps), cubes, label=valid, source=r.body,
+                  source_encoding="gzip")
     for out in outs:
         if out.spec["kind"] == "tar" and members:
             mine = [m for m in members if m[0].split("/")[0] in out.spec["products"]]
@@ -491,9 +609,14 @@ def _listed_times(ctx, group, day):
     return out
 
 
+def _past_day(day):
+    return day < utcnow().date()
+
+
 def _process_listed(ctx, group, day, outputs, supersedes, res):
     steps = day_steps(day, group["cadence_min"])
     listed = _listed_times(ctx, group, day)
+    empty = not listed and _past_day(day)
     win = _dt.timedelta(minutes=int(group.get("pick_window_min", 2)))
     picks = []
     for w in steps:
@@ -513,21 +636,34 @@ def _process_listed(ctx, group, day, outputs, supersedes, res):
         valid = iso(w)
         if r is None or not r.ok:
             for o in outs:
-                o.entry.add_missing(valid, 404 if r is None else r.status, 0 if r is None else r.tries)
+                # an empty listing for a past day is not a source gap: status 0, never "complete"
+                o.entry.add_missing(valid, 0 if empty else (404 if r is None else r.status),
+                                    0 if r is None else r.tries)
             continue
         for o in outs:
             o.entry.add_source(**r.source_record(valid_utc=valid))
         fld = ctx.decode(gzip.decompress(r.body), {"grib": None}, shape)
         if shape is None:
             shape, grid = fld.values.shape, fld.grid
-        _feed(ctx, outs, "_", i, fld.values, grid, len(steps), cubes)
+        _feed(ctx, outs, "_", i, fld, grid, len(steps), cubes, label=valid, source=r.body, source_encoding="gzip")
         resp[i] = None
     _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, [iso(w) for w in steps])
+    if empty:
+        res.failed = True
+        res.reasons.append(f"empty listing: {group['id']}")
 
 
 def _process_listed_all(ctx, group, day, outputs, supersedes, res):
     listed = _listed_times(ctx, group, day)
     outs = _init_outputs(ctx, group, day, outputs, 0, None, supersedes, res)
+    if not listed and _past_day(day):
+        # nothing listed for a past day: the day is missing, not complete
+        for o in outs:
+            o.entry["steps"]["expected"] = 1
+            o.entry.add_missing(iso(day_steps(day, 1440)[0]), 0, 1)
+        res.failed = True
+        res.reasons.append(f"empty listing: {group['id']}")
+        return
     with cf.ThreadPoolExecutor(max_workers=NODD_WORKERS) as pool:
         resp = list(pool.map(lambda tk: ctx.http.fetch(nodd_url(group["bucket"], tk[1]["key"])), listed))
     members = []

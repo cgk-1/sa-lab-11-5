@@ -3,6 +3,8 @@
 Kinds (config ``iem.datasets``):
 - ``catalog``: station network GeoJSON; a new object only when its sha256 changes;
 - ``table``: delimited replies per network and time window -> Parquet (rt) day slices (fallback: as served, zstd);
+  a network whose catalogue lists no station is skipped when ``skip_empty_catalog`` is set, and the archive's
+  "no results" reply is recorded as an empty reply, never stored;
 - ``asserved``: one reply per UTC day window, kept as served (zip as is, text zstd-compressed).
 Backfill uses the configured window (``chunk``: month or day); daily runs and refreshes use day windows.
 """
@@ -17,6 +19,7 @@ from .manifest import iso
 from .store import src_key
 
 DAY = _dt.timedelta(days=1)
+NO_RESULTS = (b"Sorry, no results found",)
 
 
 # ---------------------------------------------------------------- helpers
@@ -125,12 +128,16 @@ def run_catalog(ctx, book, ds, today):
     return out
 
 
-def station_points_from_store(store, network_suffix="_ASOS"):
-    """[(lat, lon)] of every station in the newest stored catalogue of each *_ASOS network, or None."""
+def catalog_dataset(cfg):
+    return next(d for d in cfg["iem"]["datasets"] if d["kind"] == "catalog")
+
+
+def station_points_from_store(store, prefix="src/iem-stations/v2/", network_suffix="_ASOS"):
+    """[(station id, lat, lon)] of every station in the newest stored catalogue of each *_ASOS network, or None."""
     if not store.online:
         return None
     newest = {}
-    for o in store.list("src/iem-stations/v1/"):
+    for o in store.list(prefix):
         name = o["key"].rsplit("/", 1)[1]
         net = name.split("-")[0]
         if not net.endswith(network_suffix):
@@ -143,7 +150,22 @@ def station_points_from_store(store, network_suffix="_ASOS"):
     pts = []
     for _, key in sorted(newest.values(), key=lambda x: x[1]):
         data, _ = store.get(key)
-        pts.extend((lat, lon) for _, lat, lon in parse_catalog(compact.unzstd(data)))
+        pts.extend(parse_catalog(compact.unzstd(data)))
+    return pts
+
+
+def station_points_live(ctx, network_suffix="_ASOS"):
+    """[(station id, lat, lon)] read straight from the archive's network catalogues (dry runs without storage), or
+    None if any network could not be read."""
+    ds = catalog_dataset(ctx.cfg)
+    pts = []
+    for net in networks(ctx.cfg["iem"], ds):
+        if not net.endswith(network_suffix):
+            continue
+        r = ctx.http.fetch(build_url(ctx.cfg["iem"]["base"], ds["path"].format(net=net), []).rstrip("?"))
+        if not r.ok:
+            return None
+        pts.extend(parse_catalog(r.body))
     return pts
 
 
@@ -200,6 +222,11 @@ def _store_asserved_table(ctx, book, ds, net, r, day):
 def run_table(ctx, book, ds, start, end, chunk, catalogs, skip=frozenset()):
     """One dataset over days start..end. ``skip``: days already complete."""
     nets = networks(ctx.cfg["iem"], ds)
+    if ds.get("skip_empty_catalog"):
+        empty = [n for n in nets if n in catalogs and not catalogs[n]]
+        if empty:
+            log("skip-empty-networks", ds["id"], f"networks={len(empty)}")
+        nets = [n for n in nets if n not in empty]
     days_all = [d for d in _days(start, end) if d not in skip]
     if not days_all:
         return
@@ -253,6 +280,13 @@ def _request_table(ctx, book, ds, net, stations, t0, t1, wdays):
             e.add_missing(f"{d.isoformat()}T00:00:00Z", r.status, r.tries)
     if not r.ok:
         return "missing"
+    if r.body.lstrip().startswith(NO_RESULTS):
+        # the archive's "no results" text: an empty reply, kept as a count only
+        for d in wdays:
+            e = book.entry(d, ds["id"], ds["ver"])
+            e["steps"]["got"] += 1
+            e["checks"]["empty"] = int(e["checks"].get("empty", 0)) + 1
+        return "empty"
     if _store_table_reply(ctx, book, ds, net, r, t0, t1, wdays):
         for d in wdays:
             book.entry(d, ds["id"], ds["ver"])["steps"]["got"] += 1
