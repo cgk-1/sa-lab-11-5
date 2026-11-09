@@ -11,9 +11,9 @@ on:
         description: "false = dry run: fetch, build and check, upload nothing"
         type: boolean
         default: true
-  # Owner-approved (D64). 11:13 UTC, never the top of the hour.
+  # Owner-approved. 17:13 UTC: after the late NOAA analysis hours and late reports have landed; never the top of the hour.
   schedule:
-    - cron: "13 11 * * *"
+    - cron: "13 17 * * *"
 
 permissions:
   contents: read
