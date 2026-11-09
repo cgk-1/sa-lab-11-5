@@ -114,3 +114,9 @@ def test_listing_pages():
     for i in range(5):
         s.put(f"run/r/j/{i:06d}.json", b"{}")
     assert len(list(s.list("run/r/"))) == 5
+
+
+def test_endpoint_base_drops_bucket_path_and_whitespace():
+    from feeder.store import endpoint_base
+    assert endpoint_base(" https://abc.r2.cloudflarestorage.com/wl-feed/ \n") == "https://abc.r2.cloudflarestorage.com"
+    assert endpoint_base("https://abc.r2.cloudflarestorage.com") == "https://abc.r2.cloudflarestorage.com"

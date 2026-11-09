@@ -21,6 +21,18 @@ _VER_RE = re.compile(r"^v\d+(-c\d+)?$")
 MAX_SINGLE_PUT = 4_900_000_000
 
 
+
+def endpoint_base(url):
+    """The S3 endpoint as scheme://host only. A pasted endpoint that carries the bucket as a path
+    (https://<account>.r2.cloudflarestorage.com/<bucket>) would break request signing, so the path is dropped."""
+    from urllib.parse import urlsplit
+    u = urlsplit(url.strip())
+    if not u.scheme or not u.netloc:
+        raise StoreError("S3_ENDPOINT is not a URL of the form https://host")
+    if u.path.strip("/"):
+        print("note: S3_ENDPOINT carried a path; using scheme://host only")
+    return f"{u.scheme}://{u.netloc}"
+
 class StoreError(Exception):
     pass
 
@@ -135,7 +147,8 @@ class Store:
         """Builds the client from S3_ENDPOINT / S3_BUCKET / S3_KEY_ID / S3_SECRET. Without them only a dry run
         (no reads, no writes) is possible."""
         names = ("S3_ENDPOINT", "S3_BUCKET", "S3_KEY_ID", "S3_SECRET")
-        have = all(os.environ.get(n) for n in names)
+        vals = {n: (os.environ.get(n) or "").strip() for n in names}
+        have = all(vals.values())
         if not have:
             if write:
                 raise StoreError("storage credentials are not set; a writing run needs them")
@@ -153,12 +166,12 @@ class Store:
         )
         client = boto3.client(
             "s3",
-            endpoint_url=os.environ["S3_ENDPOINT"],
-            aws_access_key_id=os.environ["S3_KEY_ID"],
-            aws_secret_access_key=os.environ["S3_SECRET"],
+            endpoint_url=endpoint_base(vals["S3_ENDPOINT"]),
+            aws_access_key_id=vals["S3_KEY_ID"],
+            aws_secret_access_key=vals["S3_SECRET"],
             config=cfg,
         )
-        return cls(client, os.environ["S3_BUCKET"], write=write)
+        return cls(client, vals["S3_BUCKET"], write=write)
 
     @property
     def online(self):
