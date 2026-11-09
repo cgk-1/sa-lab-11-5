@@ -42,7 +42,7 @@ def test_triggers_permissions_actions():
 def test_daily_schedule_is_the_approved_one():
     text = _workflows()["daily.yml"]
     assert re.search(r"^  schedule:\n    - cron: \"23 8 \* \* \*\"\n    - cron: \"13 17 \* \* \*\"$", text, re.M)
-    assert len(re.findall(r"cron:", text)) == 1
+    assert len(re.findall(r"cron:", text)) == 2
     assert not re.search(r"^\s*schedule:", _workflows()["backfill.yml"], re.M)
     # the keepalive job stays: scheduled workflows of a public repo are disabled after 60 idle days
     assert "\n  keepalive:\n" in text and "actions/workflows/daily.yml/enable" in text
