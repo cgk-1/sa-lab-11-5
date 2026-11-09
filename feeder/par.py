@@ -34,9 +34,14 @@ def procs():
 
 
 def _context():
-    methods = multiprocessing.get_all_start_methods()
-    # never fork: the main process runs download threads, and a forked child could inherit a held lock
-    return multiprocessing.get_context("forkserver" if "forkserver" in methods else "spawn")
+    """forkserver (spawn where there is none); never fork: the main process runs download threads, and a forked
+    child could inherit a held lock. As with any non-fork start, a script that starts the pool must keep its work
+    under ``if __name__ == "__main__":`` (feeder.run and feeder.daily do): each worker imports the main module."""
+    if "forkserver" in multiprocessing.get_all_start_methods():
+        ctx = multiprocessing.get_context("forkserver")
+        ctx.set_forkserver_preload(["__main__", "feeder.noaa"])  # workers start with numpy and the encoder loaded
+        return ctx
+    return multiprocessing.get_context("spawn")
 
 
 def pool():
