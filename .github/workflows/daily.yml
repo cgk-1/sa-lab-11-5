@@ -1,0 +1,103 @@
+name: daily
+
+on:
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "UTC day to append, YYYY-MM-DD (blank = yesterday)"
+        type: string
+        default: ""
+      write:
+        description: "false = dry run: fetch, build and check, upload nothing"
+        type: boolean
+        default: true
+  # NOT ACTIVE. Uncomment only after the repository owner approves this exact file.
+  # 11:13 UTC, never the top of the hour.
+  # schedule:
+  #   - cron: "13 11 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  noaa:
+    runs-on: ubuntu-24.04
+    environment: daily
+    timeout-minutes: 90
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Offline self-test
+        run: cd code && ../.venv/bin/python -E -m feeder.selftest
+      - name: Append day D (NOAA), check D-3 ETags, verify
+        env:
+          LANE: daily-noaa
+          IN_DAY: ${{ inputs.day }}
+          WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.daily
+
+  iem:
+    runs-on: ubuntu-24.04
+    environment: daily
+    timeout-minutes: 120
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Offline self-test
+        run: cd code && ../.venv/bin/python -E -m feeder.selftest
+      - name: Append day D (observations + others), re-pull D+3/8/36/120, verify D + 7 seeded days, write the index
+        env:
+          LANE: daily-iem
+          IN_DAY: ${{ inputs.day }}
+          WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
+          REFRESH_OFFSETS: "3,8,36,120"
+          VERIFY_SEEDED_DAYS: "7"
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.daily
+
+  keepalive:
+    # Public repos: scheduled workflows are disabled after 60 days without repository activity.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow on the 3rd of each month
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%d)" = "03" ]; then
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/daily.yml/enable"
+          fi

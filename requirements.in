@@ -1,0 +1,8 @@
+# Runtime dependencies (nothing else). The lock is generated with:
+#   pip-compile --generate-hashes --strip-extras --output-file=requirements.lock requirements.in
+# and installed with: pip install --no-deps --require-hashes -r requirements.lock
+numpy
+pygrib
+pyarrow
+zstandard
+boto3

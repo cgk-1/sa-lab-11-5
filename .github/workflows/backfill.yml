@@ -1,0 +1,176 @@
+name: backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: "pilot | vtec | noaa | iem | verify"
+        type: choice
+        options: [pilot, vtec, noaa, iem, verify]
+        required: true
+      start:
+        description: "first UTC day, YYYY-MM-DD (not used by pilot)"
+        type: string
+        default: ""
+      end:
+        description: "last UTC day, YYYY-MM-DD (not used by pilot)"
+        type: string
+        default: ""
+      days:
+        description: "pilot only: comma-separated UTC days"
+        type: string
+        default: ""
+      days_per_job:
+        description: "noaa lane: UTC days per job"
+        type: choice
+        options: ["1", "7"]
+        default: "7"
+      max_parallel:
+        description: "noaa lane: concurrent jobs (leave room for the account's other workflows)"
+        type: number
+        default: 14
+      write:
+        description: "false = dry run: fetch, build and check, upload nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-${{ inputs.lane == 'noaa' && 'noaa' || inputs.lane == 'verify' && 'verify' || 'iem' }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      noaa: ${{ steps.plan.outputs.noaa }}
+      iem: ${{ steps.plan.outputs.iem }}
+      verify: ${{ steps.plan.outputs.verify }}
+      parallel: ${{ steps.plan.outputs.parallel }}
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Plan (validates every input; no secrets in this job)
+        id: plan
+        env:
+          IN_LANE: ${{ inputs.lane }}
+          IN_START: ${{ inputs.start }}
+          IN_END: ${{ inputs.end }}
+          IN_DAYS: ${{ inputs.days }}
+          IN_DPJ: ${{ inputs.days_per_job }}
+          IN_PAR: ${{ inputs.max_parallel }}
+        run: cd code && python3 -E -m feeder.plan >> "$GITHUB_OUTPUT"
+
+  noaa:
+    needs: plan
+    if: needs.plan.outputs.noaa != '[]'
+    runs-on: ubuntu-24.04
+    environment: archive
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.plan.outputs.parallel) }}
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.noaa) }}
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Offline self-test
+        run: cd code && ../.venv/bin/python -E -m feeder.selftest
+      - name: Fetch, compact, tile, upload, verify
+        env:
+          LANE: noaa
+          CHUNK: ${{ matrix.chunk }}
+          RUN_KIND: ${{ inputs.lane }}
+          WRITE: ${{ inputs.write }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.run
+
+  iem:
+    needs: plan
+    if: needs.plan.outputs.iem != '[]'
+    runs-on: ubuntu-24.04
+    environment: archive
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 1            # one request in flight to the observation archive, always
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.iem) }}
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Offline self-test
+        run: cd code && ../.venv/bin/python -E -m feeder.selftest
+      - name: Fetch, compact, upload, verify (sequential, throttled)
+        env:
+          LANE: ${{ inputs.lane == 'vtec' && 'vtec' || 'iem' }}
+          CHUNK: ${{ matrix.chunk }}
+          RUN_KIND: ${{ inputs.lane }}
+          WRITE: ${{ inputs.write }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.run
+
+  verify:
+    needs: plan
+    if: needs.plan.outputs.verify != '[]'
+    runs-on: ubuntu-24.04
+    environment: archive
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.verify) }}
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Re-verify (HEAD all, sampled sha256, PMTiles range read; never deletes)
+        env:
+          LANE: verify
+          CHUNK: ${{ matrix.chunk }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.run
