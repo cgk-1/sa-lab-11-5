@@ -11,10 +11,9 @@ on:
         description: "false = dry run: fetch, build and check, upload nothing"
         type: boolean
         default: true
-  # NOT ACTIVE. Uncomment only after the repository owner approves this exact file.
-  # 11:13 UTC, never the top of the hour.
-  # schedule:
-  #   - cron: "13 11 * * *"
+  # Owner-approved (D64). 11:13 UTC, never the top of the hour.
+  schedule:
+    - cron: "13 11 * * *"
 
 permissions:
   contents: read
@@ -31,7 +30,7 @@ jobs:
   catalog:
     # Station catalogues first: the gridded lane reads them for its station cells.
     runs-on: ubuntu-24.04
-    environment: daily
+    environment: archive
     timeout-minutes: 30
     steps:
       - name: Get this commit
@@ -57,7 +56,7 @@ jobs:
   noaa:
     needs: catalog
     runs-on: ubuntu-24.04
-    environment: daily
+    environment: archive
     timeout-minutes: 120
     steps:
       - name: Get this commit
@@ -86,7 +85,7 @@ jobs:
   iem:
     needs: catalog
     runs-on: ubuntu-24.04
-    environment: daily
+    environment: archive
     timeout-minutes: 120
     steps:
       - name: Get this commit

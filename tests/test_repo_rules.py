@@ -1,5 +1,6 @@
-"""Static checks on the workflows and the tree: manual triggers only, minimal permissions, no third-party actions,
-secrets only from the environment, no schedule active, and nothing in the tree that is not generic."""
+"""Static checks on the workflows and the tree: manual triggers (plus the one approved daily schedule), minimal
+permissions, no third-party actions, secrets only from the environment, and nothing in the tree that is not
+generic."""
 
 import os
 import re
@@ -26,8 +27,11 @@ def test_triggers_permissions_actions():
         live = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
         on_block = live.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         assert "workflow_dispatch:" in on_block, name
-        for trig in ("pull_request", "pull_request_target", "workflow_run", "issue_comment", "push:", "schedule:",
-                     "repository_dispatch", "issues:"):
+        banned = ["pull_request", "pull_request_target", "workflow_run", "issue_comment", "push:",
+                  "repository_dispatch", "issues:"]
+        if name != "daily.yml":
+            banned.append("schedule:")  # only the daily append runs on a schedule
+        for trig in banned:
             assert trig not in on_block, (name, trig)
         assert re.search(r"^permissions:\n  contents: read$", live, re.M), name
         assert "uses:" not in live, name
@@ -35,10 +39,13 @@ def test_triggers_permissions_actions():
         assert "runs-on: ubuntu-24.04" in live and "latest" not in live, name
 
 
-def test_schedule_is_commented_out():
+def test_daily_schedule_is_the_approved_one():
     text = _workflows()["daily.yml"]
-    assert re.search(r"^  # schedule:\n  #   - cron: \"13 11 \* \* \*\"$", text, re.M)
-    assert not re.search(r"^\s*schedule:", text, re.M)
+    assert re.search(r"^  schedule:\n    - cron: \"13 11 \* \* \*\"$", text, re.M)
+    assert len(re.findall(r"cron:", text)) == 1
+    assert not re.search(r"^\s*schedule:", _workflows()["backfill.yml"], re.M)
+    # the keepalive job stays: scheduled workflows of a public repo are disabled after 60 idle days
+    assert "\n  keepalive:\n" in text and "actions/workflows/daily.yml/enable" in text
 
 
 def test_secrets_only_in_env_blocks_and_environment_jobs():
@@ -51,7 +58,7 @@ def test_secrets_only_in_env_blocks_and_environment_jobs():
         jobs = re.split(r"\n  (?=[a-z]+:\n)", text.split("\njobs:\n", 1)[1])
         for job in jobs:
             if "secrets." in job:
-                assert re.search(r"\n    environment: (archive|daily)\n", "\n" + job), (name, job[:40])
+                assert re.search(r"\n    environment: archive\n", "\n" + job), (name, job[:40])
 
 
 def test_inputs_never_interpolated_into_run_text():
