@@ -110,6 +110,7 @@ class Book:
         self.written = {}
         self.bytes_by_day = {}
         self.failed_days = set()
+        self.gap_days = set()   # days whose only problem is source gaps: data kept, flagged, not a run failure
         self.unchanged = 0
         self._pending = []
 
@@ -135,7 +136,12 @@ class Book:
         self.written.setdefault(day, []).extend(pr for pr, _ in res.written)
         self.bytes_by_day[day] = self.bytes_by_day.get(day, 0) + res.bytes
         if res.failed:
-            self.failed_days.add(day)
+            source_absent = all(m.get("http") in (0, 404) for e in res.entries for m in e["steps"]["missing"])
+            if res.reasons and all(str(r).startswith("gaps:") for r in res.reasons) and source_absent:
+                self.gap_days.add(day)
+                log("WARNING", "day-gaps", day.isoformat(), "; ".join(res.reasons))
+            else:
+                self.failed_days.add(day)
 
     # deferred staging (refresh): compare first, write only if changed
     def child(self):
@@ -197,7 +203,8 @@ def finish_day(ctx, book, day, pilot):
     n_checked, n_failed = verify_own(ctx, objs, pilot) if ctx.write else (0, 0)
     if n_failed:
         failed = True
-    ctx.breaker.after_day(day, book.bytes_by_day.get(day, 0), failed, n_checked, n_failed, book.unchanged)
+    ctx.breaker.after_day(day, book.bytes_by_day.get(day, 0), failed, n_checked, n_failed, book.unchanged,
+                          gapped=day in book.gap_days and not failed)
     book.unchanged = 0
     log("day", day.isoformat(), f"bytes={book.bytes_by_day.get(day, 0)}", f"failed={failed}",
         f"verified={n_checked}", f"verify_failed={n_failed}")

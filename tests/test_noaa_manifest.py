@@ -214,7 +214,9 @@ def test_gap_rule_counts_404_runs(cfg, web, clock, s3, tmp_path):
     ctx = make_ctx(cfg, web, clock, s3, tmp_path, groups=["urma"])
     book = Book(ctx)
     run_noaa_day(ctx, book, DAY)
-    assert DAY in book.failed_days  # five unlisted 404 hours: more than gap_unexplained_max
+    # five unlisted 404 hours: more than gap_unexplained_max. The source does not have them: the day is flagged
+    # (kept, partial, retried later) but is not a run failure.
+    assert DAY in book.gap_days and DAY not in book.failed_days
 
 
 def test_gap_rule_fails_day_on_unexplained_missing(cfg, web, clock, s3, tmp_path):

@@ -130,7 +130,8 @@ class Breaker:
             self.ledger.totals["cut_at_days"] = agg["cut_at_days"]
         if agg["files_verified"] and agg["files_failed"] / agg["files_verified"] > self.cfg["integrity_fail_share"]:
             self.trip(f"integrity: {agg['files_failed']} of {agg['files_verified']} verified files failed")
-        if agg["days_done"] and agg["days_failed"] / agg["days_done"] > self.cfg["day_fail_share"]:
+        if (agg["days_done"] >= int(self.cfg.get("day_fail_min_days", 1))
+                and agg["days_failed"] / agg["days_done"] > self.cfg["day_fail_share"]):
             self.trip(f"failures: {agg['days_failed']} of {agg['days_done']} days failed")
         proj = self.projection_gb(agg) if self.lane != "pilot" else None
         if proj is not None and agg["days_done"] >= self.size_min_days:
@@ -154,15 +155,16 @@ class Breaker:
             self.ledger.record("size-warning", projection_gb=round(proj, 1), budget_gb=self.cfg["budget_gb"],
                                note="budget, not a stop: the run continues")
 
-    def after_day(self, day, nbytes, failed, verified=0, verify_failed=0, unchanged=0):
+    def after_day(self, day, nbytes, failed, verified=0, verify_failed=0, unchanged=0, gapped=False):
         t = self.ledger.totals
         t["days_done"] += 1
         t["days_failed"] += 1 if failed else 0
+        t["days_gapped"] = t.get("days_gapped", 0) + (1 if gapped else 0)
         t["bytes"] += int(nbytes)
         t["files_verified"] += int(verified)
         t["files_failed"] += int(verify_failed)
         t["unchanged"] += int(unchanged)
-        self.ledger.record("day", day=day.isoformat(), bytes=int(nbytes), failed=bool(failed))
+        self.ledger.record("day", day=day.isoformat(), bytes=int(nbytes), failed=bool(failed), gapped=bool(gapped))
         exp = (self.cfg.get("expected_bytes_per_day") or {}).get(self.lane)
         if exp:
             if nbytes > self.cfg["bytes_per_day_factor"] * exp:

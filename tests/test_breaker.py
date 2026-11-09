@@ -35,17 +35,19 @@ def test_integrity_share_trips_run(bcfg):
 
 
 def test_day_failure_share_trips(bcfg):
+    bcfg[0]["day_fail_min_days"] = 1  # these tests exercise the rule itself, not its minimum sample
     b, _ = _b(bcfg)
     for _ in range(100):
         b.after_day(DAY, 10, False)
     b.check_before_day()
-    b.after_day(DAY, 10, True)
-    b.after_day(DAY, 10, True)
+    for _ in range(3):  # 3 of 103 days is above the 2% share
+        b.after_day(DAY, 10, True)
     with pytest.raises(BreakerTripped):
         b.check_before_day()
 
 
 def test_tripped_run_stops_other_jobs_cleanly(bcfg):
+    bcfg[0]["day_fail_min_days"] = 1  # these tests exercise the rule itself, not its minimum sample
     b1, store = _b(bcfg)
     b1.after_day(DAY, 10, True)
     with pytest.raises(BreakerTripped):
@@ -147,6 +149,7 @@ def test_pilot_has_no_size_rule(bcfg):
 
 
 def test_other_protections_still_stop_after_the_size_warning(bcfg):
+    bcfg[0]["day_fail_min_days"] = 1  # these tests exercise the rule itself, not its minimum sample
     cfg, _ = bcfg
     b, _ = _b(bcfg)
     huge = (cfg["budget_gb"] + 500) * 1e9 / cfg["total_days"]
@@ -159,3 +162,19 @@ def test_other_protections_still_stop_after_the_size_warning(bcfg):
     with pytest.raises(BreakerTripped) as e:  # the day-failure rule still stops the run
         b.check_before_day()
     assert "failures" in e.value.reason
+
+
+def test_day_failure_rule_waits_for_a_minimum_sample(bcfg):
+    cfg, _ = bcfg
+    b, _ = _b(bcfg)
+    assert cfg["day_fail_min_days"] >= 30
+    b.after_day(DAY, 10, True)   # 1 of 1 days failed: too few days to judge a whole run
+    b.check_before_day()
+
+
+def test_gap_only_days_do_not_count_as_failures(bcfg):
+    b, _ = _b(bcfg)
+    for _ in range(60):
+        b.after_day(DAY, 10, False, gapped=True)
+    b.check_before_day()
+    assert b.ledger.totals["days_gapped"] == 60 and b.ledger.totals["days_failed"] == 0
