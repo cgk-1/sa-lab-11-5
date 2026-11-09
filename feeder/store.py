@@ -33,6 +33,20 @@ def endpoint_base(url):
         print("note: S3_ENDPOINT carried a path; using scheme://host only")
     return f"{u.scheme}://{u.netloc}"
 
+
+def settings_check(vals):
+    """Yes/no facts about the four storage settings, safe for a public log (no values, no lengths)."""
+    import re
+    from urllib.parse import urlsplit
+    host = urlsplit(vals.get("S3_ENDPOINT", "").strip()).netloc
+    facts = {
+        "endpoint is an R2 account host": bool(re.fullmatch(r"[0-9a-f]{32}\.r2\.cloudflarestorage\.com", host)),
+        "endpoint had a path": bool(urlsplit(vals.get("S3_ENDPOINT", "").strip()).path.strip("/")),
+        "key id is 32 hex": bool(re.fullmatch(r"[0-9a-f]{32}", vals.get("S3_KEY_ID", ""))),
+        "secret is 64 hex": bool(re.fullmatch(r"[0-9a-f]{64}", vals.get("S3_SECRET", ""))),
+    }
+    return "; ".join(f"{k}: {'yes' if v else 'no'}" for k, v in facts.items())
+
 class StoreError(Exception):
     pass
 
@@ -153,6 +167,7 @@ class Store:
             if write:
                 raise StoreError("storage credentials are not set; a writing run needs them")
             return cls(None, None, write=False)
+        print("storage settings check: " + settings_check(vals))
         import boto3
         from botocore.config import Config
 

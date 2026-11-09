@@ -120,3 +120,12 @@ def test_endpoint_base_drops_bucket_path_and_whitespace():
     from feeder.store import endpoint_base
     assert endpoint_base(" https://abc.r2.cloudflarestorage.com/wl-feed/ \n") == "https://abc.r2.cloudflarestorage.com"
     assert endpoint_base("https://abc.r2.cloudflarestorage.com") == "https://abc.r2.cloudflarestorage.com"
+
+
+def test_settings_check_reports_shapes_only():
+    from feeder.store import settings_check
+    out = settings_check({"S3_ENDPOINT": "https://" + "a" * 32 + ".r2.cloudflarestorage.com/wl-feed",
+                          "S3_KEY_ID": "b" * 32, "S3_SECRET": "c" * 64, "S3_BUCKET": "x"})
+    assert out == ("endpoint is an R2 account host: yes; endpoint had a path: yes; key id is 32 hex: yes; "
+                   "secret is 64 hex: yes")
+    assert "b" * 8 not in out and "c" * 8 not in out
