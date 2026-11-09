@@ -2,9 +2,11 @@
 
 Environment: LANE (catalog | noaa | iem | vtec | verify; catalog needs no CHUNK), CHUNK (YYYY-MM-DD..YYYY-MM-DD), RUN_KIND (the dispatched lane:
 pilot | vtec | noaa | iem | verify), WRITE (true / false; false = dry run: fetch, build and check, upload nothing,
-print the manifests), CONTACT_EMAIL, and the storage secrets S3_ENDPOINT / S3_BUCKET / S3_KEY_ID / S3_SECRET.
+print the manifests), CONTACT_EMAIL, FEEDER_PROCS (worker processes for the gridded lane; see feeder.par), and the
+storage secrets S3_ENDPOINT / S3_BUCKET / S3_KEY_ID / S3_SECRET.
 """
 
+import concurrent.futures as cf
 import datetime as _dt
 import hashlib
 import os
@@ -13,7 +15,7 @@ import sys
 import tempfile
 import time
 
-from . import canonical_json, grib, iem, load_config, log, noaa, other, utcnow, verify
+from . import canonical_json, grib, iem, load_config, log, noaa, other, par, utcnow, verify
 from .breaker import Breaker, BreakerTripped, Ledger
 from .manifest import DatasetEntry, DayManifest, complete_set, day_manifests, iso
 from .net import Http
@@ -93,6 +95,7 @@ class Ctx:
         return self._points
 
     def close(self):
+        par.shutdown()
         if self._own_staging:
             shutil.rmtree(self.staging, ignore_errors=True)
 
@@ -208,8 +211,31 @@ def noaa_groups(ctx):
     return [noaa.apply_cuts(g, cuts) for g in ctx.cfg["noaa"]["groups"]]
 
 
+def _run_group(ctx, g, day, todo, sup):
+    """One group for one day, with the configured attempts; a group that keeps failing gives a failed result."""
+    attempts = int(ctx.cfg["breaker"].get("day_attempts", 3))
+    last = None
+    for k in range(attempts):
+        try:
+            return noaa.process_group(ctx, g, day, todo, supersedes=sup)
+        except FATAL:
+            raise
+        except BreakerTripped:
+            raise
+        except Exception as err:
+            last = type(err).__name__
+            log("group-error", g["id"], day.isoformat(), last, f"attempt={k + 1}")
+    res = noaa.GroupResult()
+    res.failed = True
+    res.reasons.append(f"error: {last}")
+    return res
+
+
 def run_noaa_day(ctx, book, day, force=False, only_groups=None, supersedes_by_output=None):
+    """Every group for ``day``. A group marked ``overlap`` (single-threaded work that uses no worker processes, such
+    as compressing one large bundle) runs on a thread beside the others; results are added in config order."""
     done = set() if force else complete_set(day_manifests(ctx.store, day))
+    jobs = []
     for g in noaa_groups(ctx):
         if only_groups is not None and g["id"] not in only_groups:
             continue
@@ -221,21 +247,18 @@ def run_noaa_day(ctx, book, day, force=False, only_groups=None, supersedes_by_ou
         if supersedes_by_output:
             sup = next((supersedes_by_output.get(noaa.output_id(o)) for o in todo
                         if supersedes_by_output.get(noaa.output_id(o))), None)
-        attempts = int(ctx.cfg["breaker"].get("day_attempts", 3))
-        for k in range(attempts):
-            try:
-                res = noaa.process_group(ctx, g, day, todo, supersedes=sup)
-                break
-            except FATAL:
-                raise
-            except BreakerTripped:
-                raise
-            except Exception as err:
-                log("group-error", g["id"], day.isoformat(), type(err).__name__, f"attempt={k + 1}")
-                if k + 1 == attempts:
-                    res = noaa.GroupResult()
-                    res.failed = True
-                    res.reasons.append(f"error: {type(err).__name__}")
+        jobs.append((g, todo, sup))
+    results = {}
+    with cf.ThreadPoolExecutor(max_workers=1) as side:
+        later = {g["id"]: side.submit(_run_group, ctx, g, day, todo, sup) for g, todo, sup in jobs
+                 if g.get("overlap")}
+        for g, todo, sup in jobs:
+            if g["id"] not in later:
+                results[g["id"]] = _run_group(ctx, g, day, todo, sup)
+        for gid, f in later.items():
+            results[gid] = f.result()
+    for g, _, _ in jobs:
+        res = results[g["id"]]
         book.add_group_result(day, res)
         for r in res.reasons:
             log("day-problem", g["id"], day.isoformat(), r)

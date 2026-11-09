@@ -137,11 +137,21 @@ def power(base, n):
     return out
 
 
-def ints_to_values(ints, packing):
-    """Decoded value of each packed integer X: ((X * 2**E) + R) * 10**-D, in float64, as the decoder computes it."""
+def ints_to_values(ints, packing, out=None):
+    """Decoded value of each packed integer X: ((X * 2**E) + R) * 10**-D, in float64, as the decoder computes it.
+
+    The same three float64 operations, in the same order, done in one buffer (a fresh one, or ``out``) instead of
+    one temporary array per operation: identical results, a fraction of the memory traffic on large grids."""
     s = power(2.0, int(packing["E"]))
     d = power(10.0, -int(packing["D"]))
-    return (np.asarray(ints, dtype=np.float64) * s + float(packing["R"])) * d
+    ints = np.asarray(ints)
+    if out is None:
+        out = np.empty(ints.shape, dtype=np.float64)
+    np.copyto(out, ints, casting="unsafe")
+    np.multiply(out, s, out=out)
+    np.add(out, float(packing["R"]), out=out)
+    np.multiply(out, d, out=out)
+    return out
 
 
 def same_bits(a, b):
@@ -162,11 +172,15 @@ def values_to_ints(values, packing):
         return None
     s = power(2.0, int(packing["E"]))
     d = power(10.0, -int(packing["D"]))
-    x = np.rint((v / d - float(packing["R"])) / s)
+    # rint((v / d - R) / s), one operation at a time in one buffer (bit-identical to the expression form)
+    x = np.divide(v, d)
+    np.subtract(x, float(packing["R"]), out=x)
+    np.divide(x, s, out=x)
+    np.rint(x, out=x)
     if x.size and (x.min() < 0 or x.max() > 0xFFFFFFFF):
         return None
     ints = x.astype(np.uint32)
-    if not same_bits(ints_to_values(ints, packing), v):
+    if not same_bits(ints_to_values(ints, packing, out=x), v):  # x is not needed any more: reuse its buffer
         return None
     return ints
 

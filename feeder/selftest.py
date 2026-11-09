@@ -228,6 +228,34 @@ def _checks():
         bad[-200] ^= 1
         assert not exact.verify(bytes(bad))[0]
 
+    def parallel():
+        # a step prepared in a worker process is the same bytes as one prepared here; decode-back split over the
+        # workers gives the same verdict
+        from . import par
+
+        rng = np.random.default_rng(6)
+        shape = (200, 150)
+        pack = {"template": 0, "R": 0.0, "E": 0, "D": 2, "nbits": 12, "bitmap": False}
+        vals = [grib.ints_to_values(rng.integers(0, 4096, shape), pack) for _ in range(3)]
+        if par.pool() is None:
+            return "skipped (FEEDER_PROCS: no worker processes)"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = []
+            for remote in (False, True):
+                cube = exact.ExactCube(shape, 3, tmp, 64, "dxy", 3, "auto", 2)
+                for i, v in enumerate(vals):
+                    src = b"\x00" * 200000
+                    if remote:
+                        f = par.pool().submit(exact.prepare_step, v, pack, src, "none", workers=1, **cube.params())
+                        cube.commit_step(i, str(i), f.result())
+                    else:
+                        cube.add_step(i, str(i), v, pack, src)
+                out.append(cube.to_bytes({"layer": "x"}))
+                cube.close()
+            assert out[0] == out[1]
+            assert exact.verify(out[1], submit=par.submit, parts=3, staging_dir=tmp) == exact.verify(out[0])
+        par.shutdown()
+
     def mesh_codes():
         enc = tile.Encoding(cfg["encodings"]["mesh05"])
         _, ov = enc.encode(np.array([-3.0, -1.0, 0.8, 50.0, -999.0, -99.0]))
@@ -281,7 +309,7 @@ def _checks():
             return "skipped (pygrib not installed)"
 
     return [("keys", keys), ("store", store), ("manifest", manifest), ("compact", compaction),
-            ("sparse", sparse_cube), ("exact", exact_grid), ("mesh-codes", mesh_codes), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("pygrib", grib_lib)]
+            ("sparse", sparse_cube), ("exact", exact_grid), ("parallel", parallel), ("mesh-codes", mesh_codes), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("pygrib", grib_lib)]
 
 
 def main():

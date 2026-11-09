@@ -2,6 +2,7 @@
 a 206 range read of every PMTiles and exact-grid header (header failures of both count under ``pmtiles_fail``), and a list of orphans (stored objects named in no manifest). Never
 deletes anything."""
 
+import concurrent.futures as cf
 import hashlib
 import random
 
@@ -9,46 +10,63 @@ from . import log
 from .manifest import day_manifests
 
 
+VERIFY_THREADS = 8   # object-store requests in flight (HEAD and range reads)
+VERIFY_GETS = 3      # whole-object GETs in flight (each held in memory while hashed)
+
+
+def _head_ok(store, o):
+    h = store.head(o["key"])
+    return h is not None and h["bytes"] == o["bytes"]
+
+
+def _get_ok(store, o):
+    data, _ = store.get(o["key"])
+    return hashlib.sha256(data).hexdigest() == o["sha256"]
+
+
+def _header_ok(store, key):
+    try:
+        if key.endswith(".xgrid"):
+            head, status = store.get(key, (0, 23))
+            return status == 206 and head[:8] == b"XGRID001"
+        head, status = store.get(key, (0, 126))
+        return status == 206 and head[:7] == b"PMTiles" and head[7] == 3
+    except Exception:
+        return False
+
+
 def verify_objects(store, objects, share=0.02, min_n=3, seed=0, check_all=False):
+    """The checks run concurrently; the report (counts and the sorted failed keys) is the same as one by one."""
     rep = {"objects": len(objects), "head_fail": 0, "get_checked": 0, "get_fail": 0, "pmtiles_checked": 0,
            "pmtiles_fail": 0, "failed_keys": []}
     if not store.online:
         rep["note"] = "offline"
         return rep
-    for o in objects:
-        h = store.head(o["key"])
-        if h is None or h["bytes"] != o["bytes"]:
-            rep["head_fail"] += 1
-            rep["failed_keys"].append(o["key"])
     n = len(objects) if check_all else min(len(objects), max(min_n, int(round(len(objects) * share))))
     sample = random.Random(seed).sample(list(objects), n) if n < len(objects) else list(objects)
-    for o in sample:
-        data, _ = store.get(o["key"])
+    headers = [k for k, o in enumerate(objects) if o["key"].endswith((".xgrid", ".pmtiles"))]
+    with cf.ThreadPoolExecutor(max_workers=VERIFY_THREADS) as pool, \
+            cf.ThreadPoolExecutor(max_workers=VERIFY_GETS) as gets:
+        heads = list(pool.map(lambda o: _head_ok(store, o), objects))
+        got = list(gets.map(lambda o: _get_ok(store, o), sample))
+        hdr = dict(zip(headers, pool.map(lambda k: _header_ok(store, objects[k]["key"]), headers)))
+    for o, ok in zip(objects, heads):
+        if not ok:
+            rep["head_fail"] += 1
+            rep["failed_keys"].append(o["key"])
+    for o, ok in zip(sample, got):
         rep["get_checked"] += 1
-        if hashlib.sha256(data).hexdigest() != o["sha256"]:
+        if not ok:
             rep["get_fail"] += 1
             rep["failed_keys"].append(o["key"])
-    for o in objects:
+    for k, o in enumerate(objects):
         if o["key"].endswith(".xgrid"):
             rep["xgrid_checked"] = rep.get("xgrid_checked", 0) + 1
-            try:
-                head, status = store.get(o["key"], (0, 23))
-                ok = status == 206 and head[:8] == b"XGRID001"
-            except Exception:
-                ok = False
-            if not ok:
-                rep["pmtiles_fail"] += 1
-                rep["failed_keys"].append(o["key"])
         if o["key"].endswith(".pmtiles"):
             rep["pmtiles_checked"] += 1
-            try:
-                head, status = store.get(o["key"], (0, 126))
-                ok = status == 206 and head[:7] == b"PMTiles" and head[7] == 3
-            except Exception:
-                ok = False
-            if not ok:
-                rep["pmtiles_fail"] += 1
-                rep["failed_keys"].append(o["key"])
+        if k in hdr and not hdr[k]:
+            rep["pmtiles_fail"] += 1
+            rep["failed_keys"].append(o["key"])
     rep["failed_keys"] = sorted(set(rep["failed_keys"]))
     return rep
 

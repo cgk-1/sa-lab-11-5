@@ -14,12 +14,13 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from . import canonical_json, compact, exact, grib, log, sparse, stormbox, tile, utcnow
+from . import canonical_json, compact, exact, grib, log, par, sparse, stormbox, tile, utcnow
 from .net import HttpError
 from .manifest import DatasetEntry, iso
 from .store import src_key, tile_key
 
 NODD_WORKERS = 8
+PREFETCH_STEPS = 2 * NODD_WORKERS  # downloaded steps waiting for the encoder, at most (bounds memory)
 
 
 # ---------------------------------------------------------------- addressing
@@ -286,6 +287,7 @@ def process_group(ctx, group, day, outputs, supersedes=None):
         _process_listed_all(ctx, group, day, outputs, supersedes, res)
     else:
         raise ValueError(f"unknown group kind {kind}")
+    par.log_memory(group["id"], day.isoformat())
     for e in res.entries:
         e.finish_status()
         if e["checks"].get("decode_back") == "fail" or e["checks"].get("roundtrip") == "fail":
@@ -391,11 +393,22 @@ def _attach_station_map(ctx, out, grid, smap_cache):
     return smap
 
 
+def _exact_params(ctx, o):
+    """The exact-grid cube parameters of output ``o`` (without the grid shape)."""
+    xc = ctx.cfg.get("exact", {})
+    return {"tile_size": int(o.get("tile_size", xc.get("tile_size", 128))), "predictor": o.get("predictor", "dxy"),
+            "level": int(o.get("zstd_level", xc.get("zstd_level", 19))), "store": o.get("store", "auto")}
+
+
 def _feed(ctx, outs, field_key, i, fld, grid, n_steps, cubes, label=None, source=None, source_encoding="none",
           smap_cache=None):
+    """``fld``: a decoded grib.Field, or a StepOut from ``step_job`` (exact steps already prepared, keyed by the
+    output's position in ``outs``; values present when another output needs them)."""
     values = fld.values
+    shape = tuple(getattr(fld, "shape", None) or values.shape)
+    prepared = getattr(fld, "prepared", None) or {}
     smap_cache = {} if smap_cache is None else smap_cache
-    for out in outs:
+    for n, out in enumerate(outs):
         o = out.spec
         if (o.get("field") or o.get("product")) != field_key:
             continue
@@ -404,28 +417,30 @@ def _feed(ctx, outs, field_key, i, fld, grid, n_steps, cubes, label=None, source
         k = id(out)
         if o["kind"] == "exact":
             if k not in cubes:
-                xc = ctx.cfg.get("exact", {})
-                cubes[k] = exact.ExactCube(values.shape, n_steps, ctx.staging, int(o.get("tile_size", xc.get(
-                    "tile_size", 128))), o.get("predictor", "dxy"), int(o.get("zstd_level", xc.get("zstd_level", 19))),
-                    o.get("store", "auto"), int(xc.get("workers", 4)))
+                xp = _exact_params(ctx, o)
+                cubes[k] = exact.ExactCube(shape, n_steps, ctx.staging, xp["tile_size"], xp["predictor"], xp["level"],
+                                           xp["store"], int(ctx.cfg.get("exact", {}).get("workers", 4)))
                 if o.get("station_points"):
                     _attach_station_map(ctx, out, grid, smap_cache)
-            cubes[k].add_step(i, label, values, fld.packing, source, source_encoding)
+            if n in prepared:
+                cubes[k].commit_step(i, label, prepared[n])
+            else:
+                cubes[k].add_step(i, label, values, fld.packing, source, source_encoding)
         elif o["kind"] == "sparse":
             if k not in cubes:
                 points, deg = None, None
                 if o.get("station_points"):
                     smap = _attach_station_map(ctx, out, grid, smap_cache)
                     if smap is not None:
-                        points = halo_cells([m[1] for m in smap], values.shape, int(o.get("halo", 1)))
+                        points = halo_cells([m[1] for m in smap], shape, int(o.get("halo", 1)))
                         deg = [m[2] for m in smap]
-                cubes[k] = sparse.SparseCube(values.shape, n_steps, o["threshold_mph"] / sparse.MPH_PER_MS,
+                cubes[k] = sparse.SparseCube(shape, n_steps, o["threshold_mph"] / sparse.MPH_PER_MS,
                                              o.get("lattice_step", 10), points, deg, exact=o.get("exact", True))
             cubes[k].add_step(i, values, fld.packing)
         elif o["kind"] == "tile":
             if k not in cubes:
                 enc = tile.Encoding(ctx.cfg["encodings"][o["enc"]])
-                cubes[k] = tile.TileCube(values.shape, n_steps, enc, ctx.staging, ctx.cfg.get("tile_size", 128))
+                cubes[k] = tile.TileCube(shape, n_steps, enc, ctx.staging, ctx.cfg.get("tile_size", 128))
             cubes[k].add_step(i, values)
         elif o["kind"] == "boxflags":
             out.daymax = values.copy() if out.daymax is None else np.fmax(out.daymax, values)
@@ -449,7 +464,7 @@ def _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, step_labels):
             data = cube.to_bytes(meta)
             hdr = exact.ExactReader.from_bytes(data).header
             field = group.get("fields", {}).get(o.get("field"), {"grib": None})
-            ok, rep = exact.verify(data, ctx.decode, {"grib": field.get("grib")})
+            ok, rep = exact.verify(data, ctx.decode, {"grib": field.get("grib")}, **_verify_par(ctx))
             out.entry["checks"].update({"decode_back": "pass" if ok else "fail", "exact": cube.summary(),
                                         "cells_checked": rep["checked"] * cube.shape[0] * cube.shape[1]})
             _put(ctx, res, out.entry, src_key(o["dataset"], o["ver"], day, ctx.vintage, f"{o['dataset']}-{ymd}.xgrid"),
@@ -495,20 +510,97 @@ def _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, step_labels):
                  canonical_json(doc), "application/json")
 
 
+# ---------------------------------------------------------------- per-step work (worker processes)
+
+class StepOut:
+    """What the main loop needs from one decoded step: the values (only when an output other than an exact grid
+    reads them), the packing, the grid shape, and each exact output's prepared step (exact.prepare_step)."""
+
+    def __init__(self, values, packing, shape, prepared, field=None):
+        self.values = values
+        self.packing = packing
+        self.shape = tuple(shape)
+        self.prepared = prepared
+        self.field = field  # the decoded grib.Field itself, inline only (its grid cannot cross processes)
+
+
+def step_job(decode, raw, gz, field, exact_params, want_values, threads, inline):
+    """Decode one fetched message and prepare its exact-grid steps; runs in a worker process (or inline)."""
+    fld = decode(gzip.decompress(raw) if gz else raw, field, None)
+    shape = fld.values.shape
+    prepared = {n: exact.prepare_step(fld.values, fld.packing, raw, "gzip" if gz else "none", shape=shape,
+                                      workers=threads, **xp) for n, xp in exact_params.items()}
+    return StepOut(fld.values if (want_values or inline) else None, fld.packing, shape, prepared,
+                   fld if inline else None)
+
+
+class _Steps:
+    """Starts ``step_job`` for fetched steps (in worker processes when there are any) and tracks the group's grid:
+    the first decoded step sets the shape and grid that every later step must match, as in the serial loop."""
+
+    def __init__(self, ctx, outs):
+        self.ctx = ctx
+        self.outs = outs
+        self.remote = par.pool() is not None and par.picklable(ctx.decode)
+        self.threads = 1 if self.remote else int(ctx.cfg.get("exact", {}).get("workers", 4))
+        self.ahead = par.width() if self.remote else 1  # jobs in flight (inline work runs one step at a time)
+        self.shape = None
+        self.grid = None
+
+    def start(self, i, field_key, raw, gz, field):
+        exact_params, want = {}, False
+        for n, out in enumerate(self.outs):
+            o = out.spec
+            if (o.get("field") or o.get("product")) != field_key or i not in out.steps_used:
+                continue
+            if o["kind"] == "exact":
+                exact_params[n] = _exact_params(self.ctx, o)
+            else:
+                want = True
+        args = (self.ctx.decode, raw, gz, field, exact_params, want, self.threads, not self.remote)
+        return par.pool().submit(step_job, *args) if self.remote else par.inline(step_job, *args)
+
+    def accept(self, step, raw, gz, field):
+        """Checks the step against the group's grid (the first one sets it)."""
+        if self.shape is None:
+            self.shape = step.shape
+            if step.field is not None:
+                self.grid = step.field.grid
+            else:  # the grid object stays in the main process: decode the first message here for it
+                self.grid = self.ctx.decode(gzip.decompress(raw) if gz else raw, field, None).grid
+        elif step.shape != self.shape:
+            raise grib.GribError(f"grid shape {step.shape} != expected {self.shape}")
+
+
+def _verify_par(ctx):
+    """exact.verify arguments that spread the decode-back over the worker processes (none without them)."""
+    if par.pool() is None or not par.picklable(ctx.decode):
+        return {}
+    return {"submit": par.submit, "parts": 2 * par.procs(), "staging_dir": ctx.staging}
+
+
 def _process_grib(ctx, group, day, outputs, supersedes, res):
     steps = day_steps(day, group["cadence_min"])
     fields = sorted({o["field"] for o in outputs})
     off = _dt.timedelta(minutes=int(group.get("valid_offset_min", 0)))
-    with cf.ThreadPoolExecutor(max_workers=NODD_WORKERS) as pool:
-        fetched = list(pool.map(lambda w: fetch_grib_step(ctx.http, group, fields, w), steps))
     outs = _init_outputs(ctx, group, day, outputs, len(steps), None, supersedes, res)
     known = set(group.get("known_gaps", []))
     strict = bool(group.get("gap_rule"))
-    cubes, grid, shape, smap = {}, None, None, {}
-    for i, when in enumerate(steps):
-        valid = iso(when + off)
-        for fname in fields:
-            r, st, tries, fb = fetched[i][fname]
+    cubes, smap = {}, {}
+    work = _Steps(ctx, outs)
+
+    def start(item):
+        i, fname, (r, st, tries, fb) = item
+        if r is None:
+            return None
+        return work.start(i, fname, r.body, False, group["fields"][fname])
+
+    with cf.ThreadPoolExecutor(max_workers=NODD_WORKERS) as pool:
+        fetched = par.prefetch(pool, lambda w: fetch_grib_step(ctx.http, group, fields, w), steps, PREFETCH_STEPS)
+        items = ((i, fname, got[fname]) for i, got in enumerate(fetched) for fname in fields)
+        for (i, fname, (r, st, tries, fb)), step in par.ordered(start, items, work.ahead):
+            when = steps[i]
+            valid = iso(when + off)
             if r is None:
                 for out in outs:
                     if out.spec["field"] == fname and i in out.steps_used:
@@ -518,13 +610,11 @@ def _process_grib(ctx, group, day, outputs, supersedes, res):
             for out in outs:
                 if out.spec["field"] == fname and i in out.steps_used:
                     out.entry.add_source(**src)
-            fld = ctx.decode(r.body, group["fields"][fname], shape)
-            if shape is None:
-                shape, grid = fld.values.shape, fld.grid
-            _feed(ctx, outs, fname, i, fld, grid, len(steps), cubes, label=valid, source=r.body, smap_cache=smap)
-            fetched[i][fname] = None  # release the bytes
+            work.accept(step, r.body, False, group["fields"][fname])
+            _feed(ctx, outs, fname, i, step, work.grid, len(steps), cubes, label=valid, source=r.body,
+                  smap_cache=smap)
     labels = [iso(w + off) for w in steps]
-    _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, labels)
+    _finalize(ctx, group, day, outs, cubes, work.grid, supersedes, res, labels)
     if group.get("gap_rule"):
         for out in outs:
             if ctx.breaker.gap_failed(out.entry["steps"]["missing"]):
@@ -629,24 +719,29 @@ def _process_listed(ctx, group, day, outputs, supersedes, res):
     def get(k):
         return None if k is None else ctx.http.fetch(nodd_url(group["bucket"], k["key"]))
 
+    cubes = {}
+    work = _Steps(ctx, outs)
+
+    def start(item):
+        i, r = item
+        return None if r is None or not r.ok else work.start(i, "_", r.body, True, {"grib": None})
+
     with cf.ThreadPoolExecutor(max_workers=NODD_WORKERS) as pool:
-        resp = list(pool.map(get, picks))
-    cubes, grid, shape = {}, None, None
-    for i, (w, r) in enumerate(zip(steps, resp)):
-        valid = iso(w)
-        if r is None or not r.ok:
+        fetched = par.prefetch(pool, get, picks, PREFETCH_STEPS)
+        for (i, r), step in par.ordered(start, enumerate(fetched), work.ahead):
+            valid = iso(steps[i])
+            if r is None or not r.ok:
+                for o in outs:
+                    # an empty listing for a past day is not a source gap: status 0, never "complete"
+                    o.entry.add_missing(valid, 0 if empty else (404 if r is None else r.status),
+                                        0 if r is None else r.tries)
+                continue
             for o in outs:
-                # an empty listing for a past day is not a source gap: status 0, never "complete"
-                o.entry.add_missing(valid, 0 if empty else (404 if r is None else r.status),
-                                    0 if r is None else r.tries)
-            continue
-        for o in outs:
-            o.entry.add_source(**r.source_record(valid_utc=valid))
-        fld = ctx.decode(gzip.decompress(r.body), {"grib": None}, shape)
-        if shape is None:
-            shape, grid = fld.values.shape, fld.grid
-        _feed(ctx, outs, "_", i, fld, grid, len(steps), cubes, label=valid, source=r.body, source_encoding="gzip")
-        resp[i] = None
+                o.entry.add_source(**r.source_record(valid_utc=valid))
+            work.accept(step, r.body, True, {"grib": None})
+            _feed(ctx, outs, "_", i, step, work.grid, len(steps), cubes, label=valid, source=r.body,
+                  source_encoding="gzip")
+    grid = work.grid
     _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, [iso(w) for w in steps])
     if empty:
         res.failed = True

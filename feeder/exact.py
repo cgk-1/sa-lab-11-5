@@ -87,11 +87,12 @@ def tile_slices(shape, T):
 
 
 def ints_sha256(ints):
-    return hashlib.sha256(np.ascontiguousarray(ints, dtype="<u4").tobytes()).hexdigest()
+    # hashes the array's buffer in place (the same bytes .tobytes() would copy out)
+    return hashlib.sha256(np.ascontiguousarray(ints, dtype="<u4").reshape(-1)).hexdigest()
 
 
 def values_sha256(values):
-    return hashlib.sha256(np.ascontiguousarray(values, dtype="<f8").tobytes()).hexdigest()
+    return hashlib.sha256(np.ascontiguousarray(values, dtype="<f8").reshape(-1)).hexdigest()
 
 
 _tls = threading.local()
@@ -110,6 +111,57 @@ def _decompressor():
     if d is None:
         _tls.d = d = zstandard.ZstdDecompressor()
     return d
+
+
+# ---------------------------------------------------------------- one step (pure: runs in any process)
+
+def encode_ints(ints, slices, predictor, level, workers=1):
+    """[zstd blobs], dtype name: each ``slices`` block of ``ints`` predicted, byte-shuffled and compressed as one
+    zstd frame. The blobs depend only on the integers and (predictor, level), never on ``workers``."""
+    dt = dtype_for(int(ints.max()) if ints.size else 0)
+    a = np.ascontiguousarray(ints, dtype=DTYPES[dt])
+
+    def enc(sl):
+        t = np.ascontiguousarray(a[sl])
+        return _compressor(level).compress(shuffle(predict(t, predictor)))
+
+    if workers > 1 and len(slices) > 1:
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            blobs = list(pool.map(enc, slices))
+    else:
+        blobs = [enc(sl) for sl in slices]
+    return blobs, dt
+
+
+def prepare_step(values, packing, source, source_encoding, shape, tile_size, predictor, level, store, workers=1,
+                 slices=None):
+    """(step record without its position, [blobs to append]) for one step of a cube with these parameters.
+
+    ``ints`` mode when the packed integers rebuild ``values`` bit for bit and (``store`` auto) their blobs are no
+    larger than the source; otherwise the source bytes as fetched."""
+    shape = tuple(int(x) for x in shape)
+    v = np.asarray(values, dtype=np.float64)
+    if v.shape != shape:
+        raise ExactError("step shape does not match the cube")
+    rec = {"values_sha256": values_sha256(v),
+           "source_sha256": hashlib.sha256(source).hexdigest(), "source_bytes": len(source),
+           "source_encoding": source_encoding,
+           "packing": None if packing is None else {k: packing[k] for k in ("template", "R", "E", "D", "nbits")}}
+    ints = values_to_ints(v, packing)
+    rec["int_exact"] = ints is not None
+    if ints is not None:
+        rec["ints_sha256"] = ints_sha256(ints)
+    if ints is not None and store in ("auto", "ints"):
+        blobs, dt = encode_ints(ints, slices if slices is not None else list(tile_slices(shape, int(tile_size))),
+                                predictor, int(level), workers)
+        ints_bytes = sum(len(b) for b in blobs) + 16 * len(blobs)
+        rec["ints_bytes"] = ints_bytes
+        if store == "ints" or ints_bytes <= len(source):
+            rec["dtype"] = dt
+            rec["mode"] = "ints"
+            return rec, blobs
+    rec["mode"] = "grib"
+    return rec, [bytes(source)]
 
 
 # ---------------------------------------------------------------- building
@@ -149,54 +201,32 @@ class ExactCube:
 
     def encode_ints(self, ints):
         """[zstd blobs], dtype name, for one step of integers (shape = the cube's)."""
-        dt = dtype_for(int(ints.max()) if ints.size else 0)
-        a = np.ascontiguousarray(ints, dtype=DTYPES[dt])
+        return encode_ints(ints, self.slices, self.predictor, self.level, self.workers)
 
-        def enc(sl):
-            t = np.ascontiguousarray(a[sl])
-            return _compressor(self.level).compress(shuffle(predict(t, self.predictor)))
-
-        if self.workers > 1 and len(self.slices) > 1:
-            with cf.ThreadPoolExecutor(max_workers=self.workers) as pool:
-                blobs = list(pool.map(enc, self.slices))
-        else:
-            blobs = [enc(sl) for sl in self.slices]
-        return blobs, dt
+    def params(self):
+        """What a worker process needs to prepare a step for this cube (see ``prepare_step``)."""
+        return {"shape": self.shape, "tile_size": self.T, "predictor": self.predictor, "level": self.level,
+                "store": self.store}
 
     def add_step(self, i, label, values, packing, source, source_encoding="none"):
         """``values``: the decoder's float64 field; ``packing``: its R / E / D / template / bits (or None);
         ``source``: the exact bytes fetched (one GRIB2 message, or the served .gz file)."""
-        v = np.asarray(values, dtype=np.float64)
-        if v.shape != self.shape:
-            raise ExactError("step shape does not match the cube")
-        rec = {"i": int(i), "valid_utc": label, "values_sha256": values_sha256(v),
-               "source_sha256": hashlib.sha256(source).hexdigest(), "source_bytes": len(source),
-               "source_encoding": source_encoding,
-               "packing": None if packing is None else {k: packing[k] for k in ("template", "R", "E", "D", "nbits")}}
-        ints = values_to_ints(v, packing)
-        rec["int_exact"] = ints is not None
-        if ints is not None:
-            rec["ints_sha256"] = ints_sha256(ints)
-        mode = "grib"
-        blobs = None
-        if ints is not None and self.store in ("auto", "ints"):
-            blobs, dt = self.encode_ints(ints)
-            ints_bytes = sum(len(b) for b in blobs) + 16 * len(blobs)
-            rec["ints_bytes"] = ints_bytes
-            if self.store == "ints" or ints_bytes <= len(source):
-                mode = "ints"
-                rec["dtype"] = dt
-        if mode == "ints":
-            rec["blob"] = self._append(blobs[0])
-            for b in blobs[1:]:
-                self._append(b)
-            rec["nblobs"] = len(blobs)
-            rec["stored_bytes"] = sum(len(b) for b in blobs)
-        else:
-            rec["blob"] = self._append(bytes(source))
-            rec["nblobs"] = 1
-            rec["stored_bytes"] = len(source)
-        rec["mode"] = mode
+        prepared = prepare_step(values, packing, source, source_encoding, workers=self.workers, slices=self.slices,
+                                **self.params())
+        return self.commit_step(i, label, prepared)
+
+    def commit_step(self, i, label, prepared):
+        """Appends a step made by ``prepare_step`` (here or in a worker process) as step ``i``. Steps must be
+        committed in the order the serial loop adds them, so the blob numbering is the same."""
+        rec, blobs = prepared
+        rec = dict(rec)
+        rec["i"] = int(i)
+        rec["valid_utc"] = label
+        rec["blob"] = self._append(blobs[0])
+        for b in blobs[1:]:
+            self._append(b)
+        rec["nblobs"] = len(blobs)
+        rec["stored_bytes"] = sum(len(b) for b in blobs)
         self.steps[int(i)] = rec
         return rec
 
@@ -289,14 +319,11 @@ class ExactReader:
         return None
 
 
-def verify(data, decode=None, field=None):
-    """Decode-back of a whole object: every step rebuilt from the bytes and compared bit for bit (sha256 of the
-    integers and of the float64 values; ``grib`` steps: sha256 of the stored bytes, and of the values the decoder
-    gives for them when ``decode`` is given). Returns (ok, {checked, failed: [step, ...]})."""
-    r = ExactReader.from_bytes(data)
+def _verify_steps(r, ids, decode, field):
+    """(checked, [failed step]) for the steps ``ids`` of reader ``r``, in that order."""
     failed, checked = [], 0
-    for s in r.header["steps"]:
-        i = s["i"]
+    for i in ids:
+        s = r.step(i)
         if s["mode"] == "missing":
             continue
         checked += 1
@@ -314,6 +341,58 @@ def verify(data, decode=None, field=None):
             ok = False
         if not ok:
             failed.append(i)
+    return checked, failed
+
+
+def _pread_all(fd, off, ln):
+    out = bytearray()
+    while len(out) < ln:
+        b = os.pread(fd, ln - len(out), off + len(out))
+        if not b:
+            break
+        out += b
+    return bytes(out)
+
+
+def verify_file_steps(path, ids, decode=None, field=None):
+    """``_verify_steps`` on an object stored in a file (run in a worker process)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return _verify_steps(ExactReader(lambda off, ln: _pread_all(fd, off, ln)), ids, decode, field)
+    finally:
+        os.close(fd)
+
+
+def verify(data, decode=None, field=None, submit=None, parts=1, staging_dir=None):
+    """Decode-back of a whole object: every step rebuilt from the bytes and compared bit for bit (sha256 of the
+    integers and of the float64 values; ``grib`` steps: sha256 of the stored bytes, and of the values the decoder
+    gives for them when ``decode`` is given). Returns (ok, {checked, failed: [step, ...]}).
+
+    With ``submit`` (par.submit) and ``parts`` > 1 the steps are split into ``parts`` runs checked in worker
+    processes, each reading the same bytes back from a file in ``staging_dir``; the result is the same."""
+    r = ExactReader.from_bytes(data)
+    ids = [s["i"] for s in r.header["steps"]]
+    live = [i for i in ids if r.step(i)["mode"] != "missing"]
+    if submit is None or parts <= 1 or len(live) <= 1:
+        checked, failed = _verify_steps(r, ids, decode, field)
+        return not failed, {"checked": checked, "failed": failed}
+    fd, path = tempfile.mkstemp(suffix=".xgv", dir=staging_dir)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        n = min(int(parts), len(live))
+        runs = [live[k * len(live) // n:(k + 1) * len(live) // n] for k in range(n)]
+        futures = [submit(verify_file_steps, path, run, decode, field) for run in runs]
+        checked, failed = 0, []
+        for f in futures:
+            c, fl = f.result()
+            checked += c
+            failed.extend(fl)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
     return not failed, {"checked": checked, "failed": failed}
 
 
