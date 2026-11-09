@@ -715,6 +715,8 @@ def _process_listed(ctx, group, day, outputs, supersedes, res):
     outs = _init_outputs(ctx, group, day, outputs, len(steps), None, supersedes, res)
     for o in outs:
         o.spec = {**o.spec, "field": "_"}
+    known = set(group.get("known_gaps", []))
+    strict = bool(group.get("gap_rule"))
 
     def get(k):
         return None if k is None else ctx.http.fetch(nodd_url(group["bucket"], k["key"]))
@@ -734,7 +736,8 @@ def _process_listed(ctx, group, day, outputs, supersedes, res):
                 for o in outs:
                     # an empty listing for a past day is not a source gap: status 0, never "complete"
                     o.entry.add_missing(valid, 0 if empty else (404 if r is None else r.status),
-                                        0 if r is None else r.tries)
+                                        0 if r is None else r.tries,
+                                        known_gap=(valid in known) if strict else None)
                 continue
             for o in outs:
                 o.entry.add_source(**r.source_record(valid_utc=valid))
@@ -743,6 +746,11 @@ def _process_listed(ctx, group, day, outputs, supersedes, res):
                   source_encoding="gzip")
     grid = work.grid
     _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, [iso(w) for w in steps])
+    if strict:
+        for o in outs:
+            if ctx.breaker.gap_failed(o.entry["steps"]["missing"]):
+                res.failed = True
+                res.reasons.append(f"gaps: {output_id(o.spec)}")
     if empty:
         res.failed = True
         res.reasons.append(f"empty listing: {group['id']}")

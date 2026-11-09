@@ -128,7 +128,7 @@
         "era": []
       },
       {
-        "id": "mrms-refl", "kind": "listed", "bucket": "noaa-mrms-pds", "cadence_min": 10,
+        "id": "mrms-refl", "kind": "listed", "gap_rule": true, "known_gaps": [], "bucket": "noaa-mrms-pds", "cadence_min": 10,
         "prefix": "CONUS/MergedReflectivityQCComposite_00.50/{ymd}/",
         "time_regex": "_(\\d{8})-(\\d{6})\\.grib2\\.gz$", "pick_window_min": 2,
         "outputs": [

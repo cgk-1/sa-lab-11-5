@@ -354,3 +354,10 @@ def test_verify_lane_reads_exact_grid_headers(cfg, web, clock, s3, tmp_path):
     s3.objects[key] = (b"NOTXGRID" + data[8:], ct)
     vctx2 = make_ctx(cfg, web, clock, s3, tmp_path, lane="verify", job="verify-y", run_id="903")
     assert lane_verify(vctx2, [DAY], check_all=True) > 0
+
+
+def test_reflectivity_is_under_the_gap_rule():
+    import json, pathlib
+    cfg = json.loads((pathlib.Path(__file__).parent.parent / "feeder" / "config" / "datasets.json").read_text())
+    g = next(g for g in cfg["noaa"]["groups"] if g["id"] == "mrms-refl")
+    assert g["gap_rule"] is True and g["known_gaps"] == []
