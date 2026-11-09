@@ -33,17 +33,22 @@ class _Body:
 
 
 class FakeS3:
-    """put_object (IfNoneMatch='*' -> 412 on an existing key; ContentMD5 checked), head_object, get_object (Range ->
-    206), list_objects_v2 (paged). ``locked`` prefixes refuse overwrite with 409 like a bucket lock."""
+    """put_object (IfNoneMatch='*' -> 412 on an existing key; ContentMD5 checked; StorageClass kept and reported by
+    head_object for non-STANDARD objects), head_object, get_object (Range -> 206), list_objects_v2 (paged).
+    ``locked`` prefixes refuse overwrite with 409 like a bucket lock."""
 
     def __init__(self, page_size=1000, locked=()):
         self.objects = {}
+        self.classes = {}
         self.calls = []
         self.page_size = page_size
         self.locked = tuple(locked)
 
-    def put_object(self, Bucket, Key, Body, ContentMD5=None, ContentType=None, IfNoneMatch=None):
+    def put_object(self, Bucket, Key, Body, ContentMD5=None, ContentType=None, IfNoneMatch=None,
+                   StorageClass=None):
         self.calls.append(("put", Key))
+        if StorageClass is not None and StorageClass not in ("STANDARD", "STANDARD_IA"):
+            raise _client_error(400, "InvalidStorageClass", "PutObject")
         data = bytes(Body)
         if ContentMD5 is not None and base64.b64encode(hashlib.md5(data).digest()).decode() != ContentMD5:
             raise _client_error(400, "BadDigest", "PutObject")
@@ -53,6 +58,7 @@ class FakeS3:
             if Key.startswith(self.locked):
                 raise _client_error(409, "ObjectLockedByBucketPolicy", "PutObject")
         self.objects[Key] = (data, ContentType)
+        self.classes[Key] = StorageClass or "STANDARD"
         return {"ETag": '"%s"' % hashlib.md5(data).hexdigest()}
 
     def head_object(self, Bucket, Key):
@@ -60,7 +66,10 @@ class FakeS3:
         if Key not in self.objects:
             raise _client_error(404, "404", "HeadObject")
         data, ctype = self.objects[Key]
-        return {"ContentLength": len(data), "ETag": '"%s"' % hashlib.md5(data).hexdigest(), "ContentType": ctype}
+        out = {"ContentLength": len(data), "ETag": '"%s"' % hashlib.md5(data).hexdigest(), "ContentType": ctype}
+        if self.classes.get(Key, "STANDARD") != "STANDARD":  # like S3: the header only for non-STANDARD objects
+            out["StorageClass"] = self.classes[Key]
+        return out
 
     def get_object(self, Bucket, Key, Range=None):
         self.calls.append(("get", Key))
@@ -130,7 +139,7 @@ def _checks():
     from . import compact, exact, grib, load_config, sparse, stormbox, tile
     from .breaker import Breaker, BreakerTripped, Ledger
     from .manifest import DatasetEntry, DayManifest, validate
-    from .store import OverwriteRefused, PrefixError, Store, src_key, tile_key, vintage_of
+    from .store import OverwriteRefused, PrefixError, Store, StoreError, src_key, tile_key, vintage_of
 
     cfg = load_config()
     day = _dt.date(2024, 4, 5)
@@ -163,6 +172,15 @@ def _checks():
         except OverwriteRefused:
             pass
         assert fake.objects[k][0] == b"one"
+        ia = "src/t/v1/2024/2024-04-05/v20240406T0412Z/c.bin"
+        assert s.put(ia, b"three", storage_class="STANDARD_IA")["status"] == "written"
+        assert s.head(ia)["storage_class"] == "STANDARD_IA" and s.head(k)["storage_class"] is None
+        try:
+            s.put("man/2024/2024-04-05/x.json", b"{}", storage_class="STANDARD_IA")
+            refused = False
+        except StoreError:
+            refused = True
+        assert refused, "archive class outside src/ not refused"
         dry = Store(fake, "b", write=False)
         assert dry.put("src/t/v1/2024/2024-04-05/v20240406T0412Z/b.bin", b"x")["status"] == "dry-run"
         assert "src/t/v1/2024/2024-04-05/v20240406T0412Z/b.bin" not in fake.objects
@@ -226,6 +244,32 @@ def _checks():
         assert grib.same_bits(r.values(0), vals[0]) and r.step(1)["mode"] == "missing" and r.source(2) == b"short"
         bad = bytearray(data)
         bad[-200] ^= 1
+        assert not exact.verify(bytes(bad))[0]
+
+    def exact_v2():
+        # med prediction with zigzag residuals, and the reflectivity palette with its special codes
+        i, j = np.mgrid[0:150, 0:140]
+        refl = {"template": 41, "R": -9990.0, "E": 0, "D": 1, "nbits": 16, "bitmap": False}
+        x = np.full((150, 140), 9000, np.uint32)                      # -99 no echo
+        x[:, :40] = 0                                                 # -999 outside coverage
+        m = (i - 70) ** 2 + (j - 80) ** 2 < 1600
+        x[m] = (9990 + 5 * ((i + 2 * j) % 150))[m]
+        ramp = (60000 - 3 * i - 5 * j).astype(np.uint32)             # negative residuals everywhere
+        with tempfile.TemporaryDirectory() as tmp:
+            out = {}
+            for name, pred, pal, ints, pack in (("refl", "med", "auto", x, refl), ("ramp", "med", "off", ramp, refl),
+                                                ("ramp-dxy", "dxy", "off", ramp, refl)):
+                cube = exact.ExactCube(ints.shape, 1, tmp, 64, pred, 3, "ints", 2, pal)
+                rec = cube.add_step(0, "a", grib.ints_to_values(ints, pack), pack, b"src")
+                out[name] = (cube.to_bytes({"layer": name}), rec)
+                cube.close()
+        data, rec = out["refl"]
+        assert data[:8] == b"XGRID002" and rec["dtype"] == "u1" and rec["palette"]["count"] == len(np.unique(x))
+        for name, ints in (("refl", x), ("ramp", ramp), ("ramp-dxy", ramp)):
+            assert exact.verify(out[name][0])[0], name
+            assert np.array_equal(exact.ExactReader.from_bytes(out[name][0]).ints(0), ints), name
+        bad = bytearray(data)
+        bad[-20] ^= 4
         assert not exact.verify(bytes(bad))[0]
 
     def parallel():
@@ -309,7 +353,7 @@ def _checks():
             return "skipped (pygrib not installed)"
 
     return [("keys", keys), ("store", store), ("manifest", manifest), ("compact", compaction),
-            ("sparse", sparse_cube), ("exact", exact_grid), ("parallel", parallel), ("mesh-codes", mesh_codes), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("pygrib", grib_lib)]
+            ("sparse", sparse_cube), ("exact", exact_grid), ("exact-v2", exact_v2), ("parallel", parallel), ("mesh-codes", mesh_codes), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("pygrib", grib_lib)]
 
 
 def main():

@@ -4,6 +4,11 @@ Every PUT carries ``If-None-Match: *`` and ``Content-MD5``. A 412 (or 409 from a
 resolved by a HEAD: an equal ETag (MD5) counts the object as already done; a different one stops the run.
 Keys outside the archive prefixes are refused. Credentials, bucket and endpoint come only from the environment and
 are never printed.
+
+Storage class: a PUT may name a class (``StorageClass``, sent as ``x-amz-storage-class``); R2 accepts ``STANDARD``
+and ``STANDARD_IA`` (Infrequent Access: 30-day minimum storage, retrieval billed per GB). Only keys under src/ may
+use a class other than STANDARD: manifests, run ledgers, the day index and verify reports always stay STANDARD.
+HEAD, ranged GET and the 412 / ETag path work the same for every class.
 """
 
 import datetime as _dt
@@ -19,6 +24,8 @@ _VINTAGE_RE = re.compile(r"^v\d{8}T\d{4}Z$")
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _VER_RE = re.compile(r"^v\d+(-c\d+)?$")
 MAX_SINGLE_PUT = 4_900_000_000
+STORAGE_CLASSES = ("STANDARD", "STANDARD_IA")
+CLASS_PREFIXES = ("src/",)  # the only keys that may be written in a class other than STANDARD
 
 
 
@@ -145,7 +152,8 @@ def _status_of(err):
 
 
 class PutResult(dict):
-    """{key, bytes, sha256, md5, content_type, status}; status is written | exists-identical | dry-run."""
+    """{key, bytes, sha256, md5, content_type, status, storage_class}; status is written | exists-identical |
+    dry-run; storage_class is the class asked for (the put log line shows the class the HEAD after it reports)."""
 
 
 class Store:
@@ -203,8 +211,9 @@ class Store:
             if _status_of(err) in (404, 403) or "NoSuchKey" in str(err) or "Not Found" in str(err):
                 return None
             raise
+        # storage_class: x-amz-storage-class as HEAD reports it, or None (S3 omits it for STANDARD objects)
         return {"bytes": int(r.get("ContentLength", 0)), "etag": str(r.get("ETag", "")).strip('"'),
-                "content_type": r.get("ContentType")}
+                "content_type": r.get("ContentType"), "storage_class": r.get("StorageClass")}
 
     def get(self, key, byte_range=None):
         check_key(key)
@@ -233,23 +242,30 @@ class Store:
             token = r.get("NextContinuationToken")
 
     # ---- writes
-    def put(self, key, data, content_type="application/octet-stream"):
-        """Writes ``data`` (bytes) under a new key. Never overwrites."""
+    def put(self, key, data, content_type="application/octet-stream", storage_class=None):
+        """Writes ``data`` (bytes) under a new key. Never overwrites. ``storage_class``: None (the bucket default,
+        STANDARD) or one of STORAGE_CLASSES; a class other than STANDARD only under CLASS_PREFIXES."""
         check_key(key)
+        sc = storage_class or "STANDARD"
+        if sc not in STORAGE_CLASSES:
+            raise StoreError(f"unknown storage class: {sc!r}")
+        if sc != "STANDARD" and not key.startswith(CLASS_PREFIXES):
+            raise StoreError(f"storage class {sc} is only for archive objects under src/: {key}")
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("data must be bytes")
         data = bytes(data)
         if len(data) > MAX_SINGLE_PUT:
             raise StoreError(f"object too large for a single PUT: {key}")
         res = PutResult(key=key, bytes=len(data), sha256=hashlib.sha256(data).hexdigest(), md5=md5_b64(data),
-                        content_type=content_type, status="dry-run")
+                        content_type=content_type, status="dry-run", storage_class=sc)
         if not self.write:
             return res
         if not self.online:
             raise StoreError("no storage client")
+        kw = {"StorageClass": sc} if storage_class is not None else {}
         try:
             self._client.put_object(Bucket=self._bucket, Key=key, Body=data, ContentMD5=res["md5"],
-                                    ContentType=content_type, IfNoneMatch="*")
+                                    ContentType=content_type, IfNoneMatch="*", **kw)
         except Exception as err:
             code = _status_of(err)
             if code not in (409, 412):
@@ -259,7 +275,7 @@ class Store:
                 raise StoreError(f"conditional PUT refused ({code}) but the key is absent: {key}")
             if existing["etag"].lower() == md5_hex(data) and existing["bytes"] == len(data):
                 res["status"] = "exists-identical"
-                log("exists", key, len(data), res["sha256"])
+                log("exists", key, len(data), res["sha256"], f"class={existing['storage_class'] or 'STANDARD'}")
                 return res
             raise OverwriteRefused(f"existing object differs, refusing to overwrite: {key}")
         got = self.head(key)
@@ -268,5 +284,9 @@ class Store:
         self.puts += 1
         self.bytes_written += len(data)
         res["status"] = "written"
-        log("put", key, len(data), res["sha256"])
+        reported = got.get("storage_class")
+        if reported and reported != sc:
+            log("storage-class-differs", key, f"asked={sc}", f"head={reported}")
+        # the effective class: as the HEAD after the PUT reports it, else (header absent) the class the PUT asked for
+        log("put", key, len(data), res["sha256"], f"class={reported or sc}")
         return res

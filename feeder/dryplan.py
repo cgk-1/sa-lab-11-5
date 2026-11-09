@@ -68,7 +68,8 @@ def _exact_sample(cfg, o, msg, source, encoding, field_ids, staging, sample_cell
     fld = grib.decode(msg, {"grib": field_ids})
     xc = cfg.get("exact", {})
     cube = exact.ExactCube(fld.values.shape, 1, staging, int(xc.get("tile_size", 128)), o.get("predictor", "dxy"),
-                           int(xc.get("zstd_level", 19)), o.get("store", "auto"), int(xc.get("workers", 4)))
+                           int(xc.get("zstd_level", 19)), o.get("store", "auto"), int(xc.get("workers", 4)),
+                           o.get("palette", "off"))
     rec = cube.add_step(0, "sample", fld.values, fld.packing, source, encoding)
     data = cube.to_bytes({"dataset": o["dataset"], "sample": True})
     t1 = time.monotonic()

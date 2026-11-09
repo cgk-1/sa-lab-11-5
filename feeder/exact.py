@@ -2,21 +2,36 @@
 
 Each step is stored one of two ways, both lossless:
 - ``ints``: the GRIB packed integers X (decoded value = ((X * 2**E) + R) * 10**-D, as the decoder computes it), cut
-  into ``tile_size`` x ``tile_size`` blocks; each block is a 2-D delta (``dxy``, wrapping in the block's unsigned
-  type) or left as is (``raw``), byte-shuffled and compressed as one zstd frame;
+  into ``tile_size`` x ``tile_size`` blocks; each block is predicted, its residuals are zigzag-mapped, byte-shuffled
+  and compressed as one zstd frame (format 2, below);
 - ``grib``: the source bytes exactly as fetched (one GRIB2 message, or the served .gz file).
 ``store: auto`` keeps whichever is smaller per step; ``ints`` falls back to ``grib`` for a step whose integers do not
 rebuild the decoded values bit for bit (for example a message with a bitmap).
 
-Object layout (little-endian): 24-byte head = magic ``XGRID001``, u64 header length, u64 index length; the header
-(canonical JSON: grid, tiling, and per step the mode, R / E / D / template / bits, the integer type, the first blob and
-the blob count, and sha256 of the integers, of the decoded float64 values and of the source bytes); the index (u64
-offset, u64 length per blob, relative to the data start); then the blobs. A step can be read with three range reads.
+Format 2 (magic ``XGRID002``, schema ``exact-grid/2``; written by this version):
+- each block is predicted on its own (no block reads a neighbour), with the cells above and left of the block taken
+  as 0: ``dxy`` predicts a + b - c, ``med`` the LOCO-I median edge detector (min(a, b) if c >= max(a, b), max(a, b)
+  if c <= min(a, b), else a + b - c), ``raw`` predicts 0 (a = left, b = above, c = above-left). So the first cell
+  is predicted 0, the rest of the first row by its left cell and the rest of the first column by the cell above;
+- the residual r = (X - prediction) mod 2**w is taken in [-2**(w-1), 2**(w-1)) and stored as 2r (r >= 0) or
+  -2r - 1 (r < 0) in w bits, w = 8 x the step's dtype size: small negative residuals become small numbers;
+- with ``palette`` on, a step with at most 256 distinct integers stores u1 indices into its sorted table of those
+  integers; the table is kept in the step's header record (``palette``: dtype, count, base64 of the little-endian
+  array), so an object decodes on its own.
+Format 1 (magic ``XGRID001``, schema ``exact-grid/1``; read only): ``dxy`` as a 2-D delta wrapping in the block's
+unsigned type, or ``raw``; byte-shuffled; one zstd frame per block.
+
+Object layout (little-endian): 24-byte head = magic, u64 header length, u64 index length; the header (canonical
+JSON: grid, tiling, and per step the mode, R / E / D / template / bits, the integer type, the first blob and the blob
+count, and sha256 of the integers, of the decoded float64 values and of the source bytes); the index (u64 offset,
+u64 length per blob, relative to the data start); then the blobs. A step can be read with three range reads, and
+one block of it with three range reads of its own.
 
 Exactness is proven twice: when a step is added (the integers rebuild the decoder's float64 values bit for bit) and
 after the object is built (``verify`` reads every step back from the bytes and checks both sha256 values).
 """
 
+import base64
 import concurrent.futures as cf
 import gzip
 import hashlib
@@ -32,11 +47,22 @@ import zstandard
 from . import canonical_json
 from .grib import ints_to_values, values_to_ints
 
-MAGIC = b"XGRID001"
+MAGIC_V1 = b"XGRID001"
+MAGIC = b"XGRID002"
+MAGICS = (MAGIC_V1, MAGIC)
 HEAD = struct.Struct("<8sQQ")
-SCHEMA = "exact-grid/1"
+SCHEMA_V1 = "exact-grid/1"
+SCHEMA = "exact-grid/2"
+SCHEMA_OF = {MAGIC_V1: SCHEMA_V1, MAGIC: SCHEMA}
+PREDICTORS = ("dxy", "med", "raw")
+PALETTE_MAX = 256
 DTYPES = {"u1": np.uint8, "u2": np.uint16, "u4": np.uint32}
 FORMULA = "value = ((X * 2**E) + R) * 10**-D in float64; 2**E and 10**-D built by repeated multiplication/division"
+PREDICTION = ("per block, cells above and left of the block = 0; a = left, b = above, c = above-left; dxy: a + b - c; "
+              "med: min(a, b) if c >= max(a, b), max(a, b) if c <= min(a, b), else a + b - c; raw: 0")
+RESIDUAL = ("r = (X - prediction) mod 2**w in [-2**(w-1), 2**(w-1)), stored as 2r if r >= 0 else -2r - 1 in w bits; "
+            "w = 8 x dtype size; palette steps store indices into the step's sorted table")
+_DECODE_BATCH = 256  # blocks inverted together by the med decoder (bounds memory: ~17 MB of int32 per batch)
 
 
 class ExactError(Exception):
@@ -63,7 +89,9 @@ def unshuffle(b, dtype, shape):
     return np.ascontiguousarray(np.frombuffer(b, np.uint8).reshape(dt.itemsize, -1).T).view(dt).reshape(shape)
 
 
-def predict(t, predictor):
+# ---- format 1 (read only)
+
+def predict_v1(t, predictor):
     if predictor == "raw":
         return t
     if predictor != "dxy":
@@ -74,10 +102,143 @@ def predict(t, predictor):
     return r
 
 
-def unpredict(r, predictor):
+def unpredict_v1(r, predictor):
     if predictor == "raw":
         return r
     return np.cumsum(np.cumsum(r, axis=0, dtype=r.dtype), axis=1, dtype=r.dtype)
+
+
+# ---- format 2
+
+def _check_predictor(predictor):
+    if predictor not in PREDICTORS:
+        raise ExactError(f"unknown predictor {predictor}")
+
+
+def prediction(x, predictor):
+    """Prediction of every cell of block ``x`` (int64, values in [0, 2**w)) from its original neighbours."""
+    if predictor == "raw":
+        return np.zeros_like(x)
+    p = np.zeros((x.shape[0] + 1, x.shape[1] + 1), np.int64)
+    p[1:, 1:] = x
+    a, b, c = p[1:, :-1], p[:-1, 1:], p[:-1, :-1]
+    if predictor == "dxy":
+        return a + b - c
+    mx, mn = np.maximum(a, b), np.minimum(a, b)
+    return np.where(c >= mx, mn, np.where(c <= mn, mx, a + b - c))
+
+
+def zigzag(r, dtype):
+    """Signed residuals (int64, any value; taken mod 2**w) -> w-bit zigzag codes."""
+    bits = 8 * np.dtype(dtype).itemsize
+    m = (1 << bits) - 1
+    r = np.asarray(r, np.int64) & m
+    r = np.where(r >= (1 << (bits - 1)), r - (1 << bits), r)
+    return np.where(r < 0, -2 * r - 1, 2 * r).astype(dtype)
+
+
+def unzigzag(z, work=np.int64):
+    v = np.asarray(z).astype(work)  # in place from here: fewer temporaries on big stacks
+    t = v & 1
+    np.negative(t, out=t)
+    v >>= 1
+    v ^= t
+    return v
+
+
+def predict(t, predictor):
+    """Zigzag residual codes of block ``t`` (unsigned; the codes keep its dtype)."""
+    _check_predictor(predictor)
+    x = np.asarray(t).astype(np.int64)
+    return zigzag(x - prediction(x, predictor), t.dtype)
+
+
+_DIAG = {}
+
+
+def _diagonals(shape):
+    """Flat indices (padded block, and residual block) of each anti-diagonal of a block of ``shape``: the cells of
+    one anti-diagonal depend only on earlier ones, so each is rebuilt in one vector step."""
+    if shape not in _DIAG:
+        ny, nx = shape
+        w = nx + 1
+        out = []
+        for d in range(ny + nx - 1):
+            i = np.arange(max(0, d - nx + 1), min(ny - 1, d) + 1)
+            j = d - i
+            pos = (i + 1) * w + (j + 1)
+            out.append((pos, i * nx + j, pos - 1, pos - w, pos - w - 1))
+        _DIAG[shape] = out
+    return _DIAG[shape]
+
+
+def _unmed(r, m, work):
+    """med inverse for blocks stacked on the LAST axis: r (ny, nx, n) residuals -> (ny, nx, n) values."""
+    ny, nx, n = r.shape
+    rr = r.reshape(ny * nx, n)
+    x = np.zeros(((ny + 1) * (nx + 1), n), work)
+    for pos, ri, ia, ib, ic in _diagonals((ny, nx)):
+        a, b = x[ia], x[ib]
+        g = a + b - x[ic]
+        np.maximum(g, np.minimum(a, b), out=g)  # med(a, b, c) = a + b - c clipped to [min(a, b), max(a, b)]
+        np.minimum(g, np.maximum(a, b), out=g)
+        g += rr[ri]
+        g &= m
+        x[pos] = g
+    return x.reshape(ny + 1, nx + 1, n)[1:, 1:]
+
+
+def unpredict(z, predictor, dtype=None, blocks_last=False):
+    """Inverse of ``predict`` for one block (2-D) or a stack of blocks of one shape (3-D: blocks first, or last with
+    ``blocks_last``; the result has the same layout). Returns the values as int32 (w <= 16) or int64: the arithmetic
+    is mod 2**w, which divides the working type's own wrap-around, so a sum that wraps there is still right."""
+    _check_predictor(predictor)
+    dt = np.dtype(dtype or z.dtype)
+    work = np.int32 if dt.itemsize <= 2 else np.int64
+    m = work((1 << (8 * dt.itemsize)) - 1)
+    r = unzigzag(z, work)
+    if r.ndim == 2:
+        r, one = r[..., None], True
+    else:
+        r, one = (r if blocks_last else np.moveaxis(r, 0, -1)), False
+    if predictor == "raw":
+        x = r & m
+    elif predictor == "dxy":
+        x = np.cumsum(np.cumsum(r, axis=0, dtype=work), axis=1, dtype=work)
+        x &= m
+    else:
+        r = np.ascontiguousarray(r)
+        x = np.empty(r.shape, work)
+        for s in range(0, r.shape[-1], _DECODE_BATCH):
+            x[..., s:s + _DECODE_BATCH] = _unmed(np.ascontiguousarray(r[..., s:s + _DECODE_BATCH]), m, work)
+    if one:
+        return x[..., 0]
+    return x if blocks_last else np.moveaxis(x, -1, 0)
+
+
+def palette_of(ints, palette):
+    """(sorted table, u1 indices) when ``palette`` is "auto" and the step has at most 256 distinct integers, else
+    (None, None)."""
+    if palette != "auto" or ints.size == 0:
+        return None, None
+    table = np.unique(ints)
+    if table.size > PALETTE_MAX:
+        return None, None
+    return table, np.searchsorted(table, ints).astype(np.uint8)
+
+
+def palette_record(table):
+    dt = dtype_for(int(table[-1]))
+    return {"dtype": dt, "count": int(table.size),
+            "b64": base64.b64encode(np.ascontiguousarray(table, dtype="<" + np.dtype(DTYPES[dt]).str[1:])
+                                    .tobytes()).decode("ascii")}
+
+
+def palette_table(rec):
+    t = np.frombuffer(base64.b64decode(rec["b64"]), dtype="<" + np.dtype(DTYPES[rec["dtype"]]).str[1:])
+    if t.size != int(rec["count"]):
+        raise ExactError("palette length does not match its count")
+    return t.astype(np.uint32)
 
 
 def tile_slices(shape, T):
@@ -115,11 +276,17 @@ def _decompressor():
 
 # ---------------------------------------------------------------- one step (pure: runs in any process)
 
-def encode_ints(ints, slices, predictor, level, workers=1):
-    """[zstd blobs], dtype name: each ``slices`` block of ``ints`` predicted, byte-shuffled and compressed as one
-    zstd frame. The blobs depend only on the integers and (predictor, level), never on ``workers``."""
-    dt = dtype_for(int(ints.max()) if ints.size else 0)
-    a = np.ascontiguousarray(ints, dtype=DTYPES[dt])
+def encode_ints(ints, slices, predictor, level, workers=1, palette="off"):
+    """[zstd blobs], dtype name, palette record (or None): each ``slices`` block of ``ints`` (or of its palette
+    indices) predicted, zigzag-mapped, byte-shuffled and compressed as one zstd frame. The blobs depend only on the
+    integers and (predictor, level, palette), never on ``workers``."""
+    _check_predictor(predictor)
+    table, idx = palette_of(ints, palette)
+    if table is not None:
+        dt, a, pal = "u1", idx, palette_record(table)
+    else:
+        dt = dtype_for(int(ints.max()) if ints.size else 0)
+        a, pal = np.ascontiguousarray(ints, dtype=DTYPES[dt]), None
 
     def enc(sl):
         t = np.ascontiguousarray(a[sl])
@@ -130,15 +297,15 @@ def encode_ints(ints, slices, predictor, level, workers=1):
             blobs = list(pool.map(enc, slices))
     else:
         blobs = [enc(sl) for sl in slices]
-    return blobs, dt
+    return blobs, dt, pal
 
 
 def prepare_step(values, packing, source, source_encoding, shape, tile_size, predictor, level, store, workers=1,
-                 slices=None):
+                 slices=None, palette="off"):
     """(step record without its position, [blobs to append]) for one step of a cube with these parameters.
 
-    ``ints`` mode when the packed integers rebuild ``values`` bit for bit and (``store`` auto) their blobs are no
-    larger than the source; otherwise the source bytes as fetched."""
+    ``ints`` mode when the packed integers rebuild ``values`` bit for bit and (``store`` auto) their blobs (plus the
+    palette table) are no larger than the source; otherwise the source bytes as fetched."""
     shape = tuple(int(x) for x in shape)
     v = np.asarray(values, dtype=np.float64)
     if v.shape != shape:
@@ -152,13 +319,17 @@ def prepare_step(values, packing, source, source_encoding, shape, tile_size, pre
     if ints is not None:
         rec["ints_sha256"] = ints_sha256(ints)
     if ints is not None and store in ("auto", "ints"):
-        blobs, dt = encode_ints(ints, slices if slices is not None else list(tile_slices(shape, int(tile_size))),
-                                predictor, int(level), workers)
+        blobs, dt, pal = encode_ints(ints, slices if slices is not None else list(tile_slices(shape, int(tile_size))),
+                                     predictor, int(level), workers, palette)
         ints_bytes = sum(len(b) for b in blobs) + 16 * len(blobs)
+        if pal is not None:
+            ints_bytes += pal["count"] * np.dtype(DTYPES[pal["dtype"]]).itemsize
         rec["ints_bytes"] = ints_bytes
         if store == "ints" or ints_bytes <= len(source):
             rec["dtype"] = dt
             rec["mode"] = "ints"
+            if pal is not None:
+                rec["palette"] = pal
             return rec, blobs
     rec["mode"] = "grib"
     return rec, [bytes(source)]
@@ -168,15 +339,19 @@ def prepare_step(values, packing, source, source_encoding, shape, tile_size, pre
 
 class ExactCube:
     def __init__(self, shape, n_steps, staging_dir, tile_size=128, predictor="dxy", level=19, store="auto",
-                 workers=4):
+                 workers=4, palette="off"):
         if store not in ("auto", "ints", "grib"):
             raise ExactError(f"unknown store mode {store}")
+        _check_predictor(predictor)
+        if palette not in ("auto", "off"):
+            raise ExactError(f"unknown palette mode {palette}")
         self.shape = tuple(int(x) for x in shape)
         self.n_steps = int(n_steps)
         self.T = int(tile_size)
         self.predictor = predictor
         self.level = int(level)
         self.store = store
+        self.palette = palette
         self.workers = max(1, int(workers))
         self.slices = list(tile_slices(self.shape, self.T))
         self.steps = [{"i": i, "mode": "missing"} for i in range(self.n_steps)]
@@ -200,13 +375,13 @@ class ExactCube:
         return len(self._index) - 1
 
     def encode_ints(self, ints):
-        """[zstd blobs], dtype name, for one step of integers (shape = the cube's)."""
-        return encode_ints(ints, self.slices, self.predictor, self.level, self.workers)
+        """[zstd blobs], dtype name, palette record, for one step of integers (shape = the cube's)."""
+        return encode_ints(ints, self.slices, self.predictor, self.level, self.workers, self.palette)
 
     def params(self):
         """What a worker process needs to prepare a step for this cube (see ``prepare_step``)."""
         return {"shape": self.shape, "tile_size": self.T, "predictor": self.predictor, "level": self.level,
-                "store": self.store}
+                "store": self.store, "palette": self.palette}
 
     def add_step(self, i, label, values, packing, source, source_encoding="none"):
         """``values``: the decoder's float64 field; ``packing``: its R / E / D / template / bits (or None);
@@ -236,6 +411,7 @@ class ExactCube:
     def header(self, meta):
         h = dict(meta)
         h.update({"schema": SCHEMA, "shape": list(self.shape), "tile_size": self.T, "predictor": self.predictor,
+                  "prediction": PREDICTION, "residual": RESIDUAL, "palette": self.palette,
                   "compression": {"codec": "zstd", "level": self.level, "byte_shuffle": True},
                   "tile_order": "row-major blocks of tile_size x tile_size from cell (0, 0); edge blocks are smaller",
                   "formula": FORMULA, "n_steps": self.n_steps, "steps": self.steps})
@@ -259,19 +435,21 @@ class ExactCube:
 
 class ExactReader:
     def __init__(self, read_range):
-        """``read_range(offset, length) -> bytes``."""
+        """``read_range(offset, length) -> bytes``. Reads format 1 and format 2 objects."""
         self._read = read_range
         magic, hlen, ilen = HEAD.unpack(self._read(0, HEAD.size))
-        if magic != MAGIC:
+        if magic not in MAGICS:
             raise ExactError("not an exact-grid object")
         self.header = json.loads(self._read(HEAD.size, hlen).decode("utf-8"))
-        if self.header.get("schema") != SCHEMA:
+        if self.header.get("schema") != SCHEMA_OF[magic]:
             raise ExactError("unknown exact-grid schema")
+        self.version = 1 if magic == MAGIC_V1 else 2
         raw = self._read(HEAD.size + hlen, ilen)
         self.index = np.frombuffer(raw, dtype="<u8").reshape(-1, 2) if ilen else np.zeros((0, 2), "<u8")
         self.data_off = HEAD.size + hlen + ilen
         self.shape = tuple(self.header["shape"])
         self.slices = list(tile_slices(self.shape, int(self.header["tile_size"])))
+        self._tables = {}
 
     @classmethod
     def from_bytes(cls, data):
@@ -285,18 +463,53 @@ class ExactReader:
     def step(self, i):
         return self.header["steps"][int(i)]
 
+    def _table(self, i, s):
+        if "palette" not in s:
+            return None
+        if i not in self._tables:
+            self._tables[i] = palette_table(s["palette"])
+        return self._tables[i]
+
+    @staticmethod
+    def _shape(sl):
+        return sl[0].stop - sl[0].start, sl[1].stop - sl[1].start
+
+    def _codes(self, s, k):
+        return unshuffle(_decompressor().decompress(self.blob(s["blob"] + k)), DTYPES[s["dtype"]],
+                         self._shape(self.slices[k]))
+
+    def tile(self, i, k):
+        """Packed integers (uint32) of block ``k`` of step ``i`` alone, or None if the step is not ``ints``."""
+        s = self.step(i)
+        if s["mode"] != "ints":
+            return None
+        if self.version == 1:
+            return unpredict_v1(self._codes(s, k), self.header["predictor"]).astype(np.uint32)
+        x = unpredict(self._codes(s, k), self.header["predictor"])
+        table = self._table(i, s)
+        return (table[x] if table is not None else x).astype(np.uint32)
+
     def ints(self, i):
         """Packed integers of step i (uint32, grid shape), or None if the step is stored as the source message."""
         s = self.step(i)
         if s["mode"] != "ints":
             return None
-        dt = DTYPES[s["dtype"]]
         out = np.empty(self.shape, dtype=np.uint32)
-        d = _decompressor()
+        if self.version == 1:
+            for k, sl in enumerate(self.slices):
+                out[sl] = unpredict_v1(self._codes(s, k), self.header["predictor"])
+            return out
+        table = self._table(i, s)
+        groups = {}
         for k, sl in enumerate(self.slices):
-            shp = (sl[0].stop - sl[0].start, sl[1].stop - sl[1].start)
-            r = unshuffle(d.decompress(self.blob(s["blob"] + k)), dt, shp)
-            out[sl] = unpredict(r, self.header["predictor"])
+            groups.setdefault(self._shape(sl), []).append(k)
+        for shp, ks in groups.items():  # blocks of one shape are inverted together (same result as one by one)
+            x = unpredict(np.stack([self._codes(s, k) for k in ks], axis=-1), self.header["predictor"],
+                          DTYPES[s["dtype"]], blocks_last=True)
+            if table is not None:
+                x = table[x]
+            for n, k in enumerate(ks):
+                out[self.slices[k]] = x[..., n]
         return out
 
     def source(self, i):
@@ -408,5 +621,5 @@ def manifest_record(header):
                         "nbits": p.get("nbits"), "ints_sha256": s.get("ints_sha256"),
                         "values_sha256": s["values_sha256"], "source_sha256": s["source_sha256"]})
         steps.append(rec)
-    return {"format": SCHEMA, "formula": FORMULA, "shape": header["shape"], "tile_size": header["tile_size"],
-            "predictor": header["predictor"], "steps": steps}
+    return {"format": header["schema"], "formula": FORMULA, "shape": header["shape"],
+            "tile_size": header["tile_size"], "predictor": header["predictor"], "steps": steps}

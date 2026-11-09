@@ -1,5 +1,6 @@
 import copy
 import datetime as _dt
+import json
 
 import pytest
 
@@ -63,9 +64,9 @@ def test_ledger_is_append_only(bcfg):
     assert keys == [f"run/run1/j1/{i:06d}.json" for i in (1, 2, 3)]
 
 
-def test_size_projection_applies_cuts_then_stops(bcfg):
+def test_size_projection_applies_cuts_then_warns_without_stopping(bcfg, capsys):
     cfg, cuts = bcfg
-    b, _ = _b(bcfg)
+    b, store = _b(bcfg)
     per_day = (cfg["cut_gb"] + 10 - cfg["fixed_gb_by_lane"]["noaa"]) * 1e9 / cfg["total_days"]
     for _ in range(3):
         b.after_day(DAY, per_day, False)
@@ -75,18 +76,24 @@ def test_size_projection_applies_cuts_then_stops(bcfg):
     b.check_before_day()  # needs more days before the next cut
     assert len(b.active_cuts()) == 1
     enabled = [c for c in cuts if c.get("enabled")]
-    huge = (cfg["stop_gb"] + 50 - cfg["fixed_gb_by_lane"]["noaa"]) * 1e9 / cfg["total_days"]
-    with pytest.raises(BreakerTripped) as e:
-        for _ in range(40):
-            b.after_day(DAY, huge, False)
-            b.check_before_day()
-    assert len(b.active_cuts()) == len(enabled) and "size" in e.value.reason
+    huge = (cfg["budget_gb"] + 50 - cfg["fixed_gb_by_lane"]["noaa"]) * 1e9 / cfg["total_days"]
+    for _ in range(40):  # D64: 2.5 TB is a budget, not a hard stop
+        b.after_day(DAY, huge, False)
+        b.check_before_day()
+    assert len(b.active_cuts()) == len(enabled)
     assert not {"refl-15min", "urma-wind-2h"} & {c["id"] for c in b.active_cuts()}
+    assert b.ledger.totals["tripped"] is None
+    events = [json.loads(v[0]) for k, v in sorted(store._client.objects.items()) if k.startswith("run/")]
+    warns = [e for e in events if e["kind"] == "size-warning"]
+    assert len(warns) == 1 and warns[0]["projection_gb"] > cfg["budget_gb"] and warns[0]["budget_gb"] == 2500.0
+    assert not [e for e in events if e["kind"] == "tripped"]
+    out = capsys.readouterr().out
+    assert "WARNING size projection_gb=" in out and "budget_gb=2500.0" in out
 
 
 def test_caps_for_two_and_a_half_tb(bcfg):
     cfg, cuts = bcfg
-    assert cfg["stop_gb"] == 2500.0 and cfg["cut_gb"] < cfg["stop_gb"]
+    assert cfg["budget_gb"] == 2500.0 and cfg["cut_gb"] < cfg["budget_gb"] and "stop_gb" not in cfg
     assert {c["id"]: c["enabled"] for c in cuts}["refl-15min"] is False
     assert {c["id"]: c["enabled"] for c in cuts}["urma-wind-2h"] is False
     # every lane's projection carries the other lanes' footprint; all lanes together stay inside the cap
@@ -137,3 +144,18 @@ def test_pilot_has_no_size_rule(bcfg):
         b.after_day(DAY, 10 ** 12, False)
     b.check_before_day()
     assert b.active_cuts() == []
+
+
+def test_other_protections_still_stop_after_the_size_warning(bcfg):
+    cfg, _ = bcfg
+    b, _ = _b(bcfg)
+    huge = (cfg["budget_gb"] + 500) * 1e9 / cfg["total_days"]
+    for _ in range(30):
+        b.after_day(DAY, huge, False)
+        b.check_before_day()
+    assert b.size_warned
+    b.after_day(DAY, huge, True)
+    b.after_day(DAY, huge, True)
+    with pytest.raises(BreakerTripped) as e:  # the day-failure rule still stops the run
+        b.check_before_day()
+    assert "failures" in e.value.reason

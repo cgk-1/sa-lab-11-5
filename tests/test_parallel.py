@@ -24,17 +24,19 @@ from feeder.run import lane_noaa
 from conftest import DAY, NX, NY, add_urma, fake_message, make_ctx
 
 # sha256 of every object this fixture day stores, as written by the serial code before the parallel lane (git
-# 238dac3); file name -> sha256.
+# 238dac3); file name -> sha256. The .xgrid objects are exact-grid format 2 (golden bytes of the new encoding,
+# pinned zstandard 0.25.0); their format 1 sha256 were refl-x ddb09ce6..., urma-gust-x e7b0b38a...,
+# urma-wdir-x 32ca77b3..., urma-wind-x e66b4975....
 GOLDEN = {
     "boxflags-mesh-20240405.json": "ccba38decb55013185e876f78937b6dd58d4b46249824a2c4c58cf7e18558231",
     "boxflags-urma-20240405.json": "d9ddd2019e6163d7693d4e37fb7664b10136a027bd2678388548fdb45bfcbaf9",
     "mrms-mesh-raw-20240405.tar": "7ff712227bc4a63d1b15c0b51e68a0d438a28e2456ebe5595e50972b3ee12da6",
     "probsevere-json-20240405.tar.zst": "a7567e872ef459082f837fdeceed66c66a51c288564b6d1617c4577d34ee1872",
-    "refl-x-20240405.xgrid": "ddb09ce619cd5165d87472a29cee71124b8d0197e741c3c29e77a6514604db41",
+    "refl-x-20240405.xgrid": "3c7589cb2341795fedcc76d6fbd49f0bda364d5922223566571885d0803a4ca6",
     "urma-gust-ex-20240405.parquet": "e154c3ca9c725d59088a06ab5eb84925d463ea9d6da6250253b689c565f4d1aa",
-    "urma-gust-x-20240405.xgrid": "e7b0b38aff87ad0addfea7bb8469a5ade05a7811d2f712c85c5ed2822b06185a",
-    "urma-wdir-x-20240405.xgrid": "32ca77b3c7b083d01c028fa5d15b543e1bb38760fd2addbda999470efe1a5eaa",
-    "urma-wind-x-20240405.xgrid": "e66b4975df1524738562deb74432ba23a57003d7073dc82f7b71a1953a05ba36",
+    "urma-gust-x-20240405.xgrid": "9875147cb71234441fe747ae06045e7f5410970450b80931548f10f1d3888331",
+    "urma-wdir-x-20240405.xgrid": "0217b6702b099664cca74c66a359c2518405acaa2c5afde6cb6b0a832da40146",
+    "urma-wind-x-20240405.xgrid": "0fd5c02fe20bbd35804e09f26030f3aeac86ea5937d514ead5d6dd2b609835c6",
 }
 
 

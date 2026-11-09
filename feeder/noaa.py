@@ -226,8 +226,8 @@ def _era(group, day):
     return [e["flag"] for e in group.get("era", []) if day.isoformat() < e["before"]]
 
 
-def _put(ctx, res, entry, key, data, ctype, covers=None, exact=None):
-    pr = ctx.store.put(key, data, ctype)
+def _put(ctx, res, entry, key, data, ctype, covers=None, exact=None, storage_class=None):
+    pr = ctx.store.put(key, data, ctype, storage_class=storage_class)
     entry.add_object(pr, covers, exact)
     res.written.append((pr, data))
     res.bytes += pr["bytes"]
@@ -397,7 +397,17 @@ def _exact_params(ctx, o):
     """The exact-grid cube parameters of output ``o`` (without the grid shape)."""
     xc = ctx.cfg.get("exact", {})
     return {"tile_size": int(o.get("tile_size", xc.get("tile_size", 128))), "predictor": o.get("predictor", "dxy"),
-            "level": int(o.get("zstd_level", xc.get("zstd_level", 19))), "store": o.get("store", "auto")}
+            "level": int(o.get("zstd_level", xc.get("zstd_level", 19))), "store": o.get("store", "auto"),
+            "palette": o.get("palette", "off")}
+
+
+def storage_class_for(cfg, o):
+    """The storage class for the src/ objects of gridded output ``o``: the archive class (one switch,
+    ``storage.archive_class_on``) for the configured output kinds, else None (the bucket default, STANDARD)."""
+    st = cfg.get("storage", {})
+    if st.get("archive_class_on") and o.get("kind") in st.get("archive_kinds", []):
+        return st.get("archive_class")
+    return None
 
 
 def _feed(ctx, outs, field_key, i, fld, grid, n_steps, cubes, label=None, source=None, source_encoding="none",
@@ -419,7 +429,8 @@ def _feed(ctx, outs, field_key, i, fld, grid, n_steps, cubes, label=None, source
             if k not in cubes:
                 xp = _exact_params(ctx, o)
                 cubes[k] = exact.ExactCube(shape, n_steps, ctx.staging, xp["tile_size"], xp["predictor"], xp["level"],
-                                           xp["store"], int(ctx.cfg.get("exact", {}).get("workers", 4)))
+                                           xp["store"], int(ctx.cfg.get("exact", {}).get("workers", 4)),
+                                           xp["palette"])
                 if o.get("station_points"):
                     _attach_station_map(ctx, out, grid, smap_cache)
             if n in prepared:
@@ -468,7 +479,8 @@ def _finalize(ctx, group, day, outs, cubes, grid, supersedes, res, step_labels):
             out.entry["checks"].update({"decode_back": "pass" if ok else "fail", "exact": cube.summary(),
                                         "cells_checked": rep["checked"] * cube.shape[0] * cube.shape[1]})
             _put(ctx, res, out.entry, src_key(o["dataset"], o["ver"], day, ctx.vintage, f"{o['dataset']}-{ymd}.xgrid"),
-                 data, "application/octet-stream", exact=exact.manifest_record(hdr))
+                 data, "application/octet-stream", exact=exact.manifest_record(hdr),
+                 storage_class=storage_class_for(ctx.cfg, o))
             cube.close()
             if not ok:
                 res.failed = True
@@ -679,7 +691,7 @@ def _process_files(ctx, group, day, outputs, supersedes, res):
             out.entry["checks"].update({"roundtrip": "pass" if ok else "fail", "members": compact.member_records(mine)})
             _put(ctx, res, out.entry, src_key(out.spec["dataset"], out.spec["ver"], day, ctx.vintage,
                                               f"{out.spec['dataset']}-{day.strftime('%Y%m%d')}.tar"), data,
-                 "application/x-tar")
+                 "application/x-tar", storage_class=storage_class_for(ctx.cfg, out.spec))
             if not ok:
                 res.failed = True
     _finalize(ctx, group, day, [o for o in outs if o.spec["kind"] != "tar"], cubes, grid, supersedes, res,
@@ -791,7 +803,7 @@ def _process_listed_all(ctx, group, day, outputs, supersedes, res):
         o.entry["checks"].update({"roundtrip": "pass" if ok else "fail", "members": len(members)})
         _put(ctx, res, o.entry, src_key(o.spec["dataset"], o.spec["ver"], day, ctx.vintage,
                                         f"{o.spec['dataset']}-{day.strftime('%Y%m%d')}.tar.zst"), data,
-             "application/zstd")
+             "application/zstd", storage_class=storage_class_for(ctx.cfg, o.spec))
         if not ok:
             res.failed = True
 

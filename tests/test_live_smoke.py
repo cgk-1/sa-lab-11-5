@@ -97,6 +97,24 @@ def test_iem_asos_one_station_one_day(http, outdir):
           f"columns={len(t.column_names) - 1}")
 
 
+def _xparams(cfg, dataset):
+    o = next(o for g in cfg["noaa"]["groups"] for o in g["outputs"] if o.get("dataset") == dataset)
+    return o.get("predictor", "dxy"), o.get("palette", "off")
+
+
+def _v1_ints_bytes(ints, T=128, level=19):
+    """What the format 1 encoder stored for these integers (2-D delta wrapping in the block type, byte shuffle,
+    zstd), plus its 16 B of index per block: the reference for the size ratio."""
+    import zstandard
+
+    from feeder import exact
+
+    a = np.ascontiguousarray(ints, dtype=exact.DTYPES[exact.dtype_for(int(ints.max()))])
+    c = zstandard.ZstdCompressor(level=level, write_checksum=True)
+    return sum(len(c.compress(exact.shuffle(exact.predict_v1(np.ascontiguousarray(a[sl]), "dxy")))) + 16
+               for sl in exact.tile_slices(ints.shape, T))
+
+
 @pytest.mark.parametrize("group_id,field,when", [
     ("urma", "gust", _dt.datetime(2024, 5, 7, 21, tzinfo=_dt.timezone.utc)),       # 5.0 simple, 0.01 m/s
     ("hrrr", "gust", _dt.datetime(2024, 5, 7, 20, tzinfo=_dt.timezone.utc)),       # 5.3 complex, 1/16 m/s
@@ -118,13 +136,18 @@ def test_exact_decode_back_real_message(http, group_id, field, when, tmp_path):
     fld = grib.decode(body, group["fields"][field])
     ints = grib.values_to_ints(fld.values, fld.packing)
     assert ints is not None and grib.same_bits(grib.ints_to_values(ints, fld.packing), fld.values)
-    cube = exact.ExactCube(fld.values.shape, 1, str(tmp_path), 128, "dxy", 19, "auto", 4)
+    dataset = {"urma": "urma", "hrrr": "hrrr", "rtma-ru": "ru"}[group_id] + f"-{field}-x"
+    predictor, palette = _xparams(cfg, dataset)
+    cube = exact.ExactCube(fld.values.shape, 1, str(tmp_path), 128, predictor, 19, "auto", 4, palette)
     rec = cube.add_step(0, noaa.iso(when), fld.values, fld.packing, body)
     data = cube.to_bytes({})
     cube.close()
     ok, rep = exact.verify(data, grib.decode, {"grib": group["fields"][field]["grib"]})
     assert ok and rep["checked"] == 1
-    print("exact", group_id, field, fld.packing, rec["mode"], f"source={len(body)}", f"object={len(data)}")
+    assert np.array_equal(exact.ExactReader.from_bytes(data).ints(0), ints)
+    v1 = _v1_ints_bytes(ints)
+    print("exact", dataset, predictor, fld.packing, rec["mode"], f"source={len(body)}", f"object={len(data)}",
+          f"ints_v2={rec['ints_bytes']}", f"ints_v1={v1}", f"ratio={rec['ints_bytes'] / v1:.3f}")
 
 
 def test_exact_decode_back_real_reflectivity(http, tmp_path):
@@ -139,9 +162,21 @@ def test_exact_decode_back_real_reflectivity(http, tmp_path):
     key = next(k["key"] for k in keys if k["key"].endswith("-200039.grib2.gz") or "-2000" in k["key"])
     r = http.get(noaa.nodd_url(group["bucket"], key))
     fld = grib.decode(gzip.decompress(r.body), {"grib": None})
-    cube = exact.ExactCube(fld.values.shape, 1, str(tmp_path), 128, "raw", 19, "auto", 4)
+    predictor, palette = _xparams(cfg, "refl-x")
+    cube = exact.ExactCube(fld.values.shape, 1, str(tmp_path), 128, predictor, 19, "auto", 4, palette)
     rec = cube.add_step(0, key, fld.values, fld.packing, r.body, "gzip")
     data = cube.to_bytes({})
     cube.close()
     assert rec["int_exact"] and exact.verify(data, grib.decode)[0]
-    print("exact refl", fld.packing, rec["mode"], f"source={len(r.body)}", f"object={len(data)}")
+    ints = grib.values_to_ints(fld.values, fld.packing)
+    assert np.array_equal(exact.ExactReader.from_bytes(data).ints(0), ints)
+    # format 1 stored reflectivity with the raw predictor
+    import zstandard
+
+    c = zstandard.ZstdCompressor(level=19, write_checksum=True)
+    a = np.ascontiguousarray(ints, dtype=exact.DTYPES[exact.dtype_for(int(ints.max()))])
+    v1 = sum(len(c.compress(exact.shuffle(np.ascontiguousarray(a[sl])))) + 16
+             for sl in exact.tile_slices(ints.shape, 128))
+    print("exact refl-x", predictor, palette, fld.packing, rec["mode"], f"palette={rec.get('palette', {}).get('count')}",
+          f"source={len(r.body)}", f"object={len(data)}", f"ints_v2={rec['ints_bytes']}", f"ints_v1={v1}",
+          f"ratio={rec['ints_bytes'] / v1:.3f}")

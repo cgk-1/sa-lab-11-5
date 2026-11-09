@@ -129,3 +129,59 @@ def test_settings_check_reports_shapes_only():
     assert out == ("endpoint is an R2 account host: yes; endpoint had a path: yes; key id is 32 hex: yes; "
                    "secret is 64 hex: yes")
     assert "b" * 8 not in out and "c" * 8 not in out
+
+
+def test_storage_class_on_src_keys_only(capsys):
+    fake = FakeS3()
+    calls = []
+    orig = fake.put_object
+
+    def spy(**kw):
+        calls.append(kw)
+        return orig(**kw)
+
+    fake.put_object = spy
+    s = Store(fake, "b", write=True)
+    k = "src/a/v2/2023/2023-07-01/" + V + "/x.xgrid"
+    r = s.put(k, b"grid", storage_class="STANDARD_IA")
+    assert r["status"] == "written" and r["storage_class"] == "STANDARD_IA"
+    assert calls[-1]["StorageClass"] == "STANDARD_IA" and calls[-1]["IfNoneMatch"] == "*"
+    assert s.head(k)["storage_class"] == "STANDARD_IA"  # HEAD works on IA objects and reports the class
+    line = next(x for x in capsys.readouterr().out.splitlines() if x.startswith("put "))
+    assert line.startswith(f"put {k} 4 ") and line.endswith(" class=STANDARD_IA")
+    # the same bytes again: the 412 path resolves by HEAD / ETag as for STANDARD objects
+    assert s.put(k, b"grid", storage_class="STANDARD_IA")["status"] == "exists-identical"
+    assert "class=STANDARD_IA" in capsys.readouterr().out
+    with pytest.raises(OverwriteRefused):
+        s.put(k, b"other", storage_class="STANDARD_IA")
+    # no class asked: nothing sent, the bucket default
+    k2 = "man/2023/2023-07-01/1-1-j.json"
+    s.put(k2, b"{}")
+    assert "StorageClass" not in calls[-1] and s.head(k2)["storage_class"] is None  # S3: no header for STANDARD
+    assert "class=STANDARD" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("key", ["man/2023/2023-07-01/1-1-j.json", "run/r/j/000001.json", "idx/v1/2023-07-01/1-1.json",
+                                 "vrf/2023-07-01/1-1-j.json", "tiles/x/v1/2023/2023-07-01.pmtiles"])
+def test_infrequent_access_refused_outside_src(key):
+    s = Store(FakeS3(), "b", write=True)
+    with pytest.raises(Exception, match="only for archive objects under src/"):
+        s.put(key, b"x", storage_class="STANDARD_IA")
+    with pytest.raises(Exception, match="unknown storage class"):
+        s.put("src/a/v1/2023/2023-07-01/" + V + "/x.bin", b"x", storage_class="GLACIER")
+    assert s.put(key, b"x", storage_class="STANDARD")["status"] == "written"
+
+
+def test_put_log_shows_the_asked_class_when_head_reports_none(capsys):
+    fake = FakeS3()
+    orig = fake.head_object
+
+    def head(**kw):  # a store that never reports x-amz-storage-class
+        out = orig(**kw)
+        out.pop("StorageClass", None)
+        return out
+
+    fake.head_object = head
+    s = Store(fake, "b", write=True)
+    s.put("src/a/v2/2023/2023-07-01/" + V + "/y.xgrid", b"g", storage_class="STANDARD_IA")
+    assert capsys.readouterr().out.strip().endswith("class=STANDARD_IA")

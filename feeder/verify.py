@@ -1,6 +1,7 @@
 """Re-verification: HEAD every object listed in the manifests (length must match), GET + sha256 on a seeded sample,
 a 206 range read of every PMTiles and exact-grid header (header failures of both count under ``pmtiles_fail``), and a list of orphans (stored objects named in no manifest). Never
-deletes anything."""
+deletes anything. HEAD and ranged GET work the same on objects in the Infrequent Access class (a GET of one is billed
+as a retrieval; the sample keeps those few)."""
 
 import concurrent.futures as cf
 import hashlib
@@ -28,7 +29,7 @@ def _header_ok(store, key):
     try:
         if key.endswith(".xgrid"):
             head, status = store.get(key, (0, 23))
-            return status == 206 and head[:8] == b"XGRID001"
+            return status == 206 and head[:8] in (b"XGRID001", b"XGRID002")  # format 1 and format 2 objects
         head, status = store.get(key, (0, 126))
         return status == 206 and head[:7] == b"PMTiles" and head[7] == 3
     except Exception:

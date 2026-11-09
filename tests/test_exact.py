@@ -21,7 +21,7 @@ def _field(rng, shape, pack, xmax):
     ({"template": 41, "R": -30.0, "E": 0, "D": 1, "nbits": 16}, 200, "u1"),            # MESH, mostly -3 / -1
     ({"template": 41, "R": -9990.0, "E": 0, "D": 1, "nbits": 32}, 90000, "u4"),        # wide integers
 ])
-@pytest.mark.parametrize("predictor", ["dxy", "raw"])
+@pytest.mark.parametrize("predictor", ["dxy", "med", "raw"])
 def test_ints_round_trip_bit_exact(tmp_path, pack, xmax, dtype, predictor):
     rng = np.random.default_rng(5)
     shape = (300, 270)  # edge blocks smaller than the tile

@@ -65,14 +65,15 @@ def test_exact_grids_are_bit_exact(cfg, web, clock, s3, tmp_path):
     by = {d["id"]: d for d in m["datasets"]}
     for name in ("gust", "wind", "wdir"):
         e = by[f"urma-{name}-x"]
-        assert e["ver"] == "v1" and e["checks"]["decode_back"] == "pass"
+        assert e["ver"] == "v2" and e["checks"]["decode_back"] == "pass"
         assert e["checks"]["exact"] == {"steps_ints": 24, "steps_grib": 0, "steps_missing": 0}
         o = e["objects"][0]
         assert o["key"].endswith(f"urma-{name}-x-{DAY:%Y%m%d}.xgrid")
         data = s3.objects[o["key"]][0]
         r = exact.ExactReader.from_bytes(data)
         rec = o["exact"]
-        assert rec["format"] == "exact-grid/1" and len(rec["steps"]) == 24
+        assert rec["format"] == "exact-grid/2" and len(rec["steps"]) == 24
+        assert data[:8] == b"XGRID002" and r.header["predictor"] == ("dxy" if name == "gust" else "med")
         for h in (0, 7, 23):
             want = _decoded(name, h)
             got = r.values(h)
@@ -361,3 +362,51 @@ def test_reflectivity_is_under_the_gap_rule():
     cfg = json.loads((pathlib.Path(__file__).parent.parent / "feeder" / "config" / "datasets.json").read_text())
     g = next(g for g in cfg["noaa"]["groups"] if g["id"] == "mrms-refl")
     assert g["gap_rule"] is True and g["known_gaps"] == []
+
+
+def _classes(s3):
+    return {k: s3.classes.get(k, "STANDARD") for k in s3.objects}
+
+
+def test_archive_objects_go_to_infrequent_access_and_the_rest_stays_standard(cfg, web, clock, s3, tmp_path):
+    from feeder import noaa
+
+    add_urma(web)
+    ctx = make_ctx(cfg, web, clock, s3, tmp_path, groups=["urma"])
+    lane_noaa(ctx, DAY, DAY, pilot=True)
+    cls = _classes(s3)
+    xgrids = [k for k in cls if k.endswith(".xgrid")]
+    assert len(xgrids) == 3 and all(cls[k] == "STANDARD_IA" for k in xgrids)
+    others = [k for k in cls if not k.endswith(".xgrid") and not k.startswith("src/iem-stations/")]
+    assert any(k.startswith("man/") for k in others) and any(k.startswith("run/") for k in others)
+    assert any(k.endswith(".parquet") for k in others) and any(k.endswith(".json") and k.startswith("src/")
+                                                               for k in others)
+    assert all(cls[k] == "STANDARD" for k in others), {k: cls[k] for k in others if cls[k] != "STANDARD"}
+    # the tar bundles (MESH, ProbSevere) are archive objects too; sparse cubes and box flags are not
+    st = cfg["storage"]
+    assert st["archive_class_on"] is True and st["archive_class"] == "STANDARD_IA"
+    assert noaa.storage_class_for(cfg, {"kind": "tar"}) == "STANDARD_IA"
+    assert noaa.storage_class_for(cfg, {"kind": "exact"}) == "STANDARD_IA"
+    for kind in ("sparse", "boxflags", "tile"):
+        assert noaa.storage_class_for(cfg, {"kind": kind}) is None
+
+
+def test_archive_class_switch_off_writes_everything_standard(cfg, web, clock, s3, tmp_path):
+    add_urma(web)
+    cfg = copy.deepcopy(cfg)
+    cfg["storage"]["archive_class_on"] = False
+    ctx = make_ctx(cfg, web, clock, s3, tmp_path, groups=["urma"])
+    lane_noaa(ctx, DAY, DAY, pilot=True)
+    assert set(_classes(s3).values()) == {"STANDARD"}
+    assert all(d["status"] == "complete" for d in _manifests(s3)[0]["datasets"])
+
+
+def test_verify_lane_passes_on_infrequent_access_objects(cfg, web, clock, s3, tmp_path):
+    from feeder.run import lane_verify
+
+    add_urma(web)
+    ctx = make_ctx(cfg, web, clock, s3, tmp_path, groups=["urma"])
+    lane_noaa(ctx, DAY, DAY, pilot=False)
+    assert "STANDARD_IA" in set(_classes(s3).values())
+    vctx = make_ctx(cfg, web, clock, s3, tmp_path, lane="verify", job="verify-ia", run_id="904")
+    assert lane_verify(vctx, [DAY], check_all=True) == 0

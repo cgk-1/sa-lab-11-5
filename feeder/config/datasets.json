@@ -33,7 +33,10 @@
   "tile_size": 128,
 
   "exact": {"tile_size": 128, "zstd_level": 19, "workers": 4,
-            "note": "exact grids: GRIB packed integers in 128x128 zstd tiles, or the source message when smaller"},
+            "note": "exact grids (format 2): GRIB packed integers in 128x128 tiles, dxy or med prediction, zigzag residuals, zstd; reflectivity through a per-step palette; or the source message when smaller. v1 objects stay readable"},
+
+  "storage": {"archive_class_on": true, "archive_class": "STANDARD_IA", "archive_kinds": ["exact", "tar"],
+              "note": "one switch: src/ objects of the gridded outputs of these kinds (exact grids, the MESH and ProbSevere bundles) are written in this storage class; everything else, and every key outside src/, stays STANDARD"},
 
   "noaa": {
     "groups": [
@@ -47,10 +50,10 @@
           "wdir": {"idx": "WDIR:10 m above ground:anl", "grib": [0, 2, 0]}
         },
         "outputs": [
-          {"kind": "exact", "dataset": "urma-gust-x", "ver": "v1", "field": "gust", "store": "auto", "predictor": "dxy",
+          {"kind": "exact", "dataset": "urma-gust-x", "ver": "v2", "field": "gust", "store": "auto", "predictor": "dxy",
            "station_points": true},
-          {"kind": "exact", "dataset": "urma-wind-x", "ver": "v1", "field": "wind", "store": "auto", "predictor": "dxy"},
-          {"kind": "exact", "dataset": "urma-wdir-x", "ver": "v1", "field": "wdir", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "urma-wind-x", "ver": "v2", "field": "wind", "store": "auto", "predictor": "med"},
+          {"kind": "exact", "dataset": "urma-wdir-x", "ver": "v2", "field": "wdir", "store": "auto", "predictor": "med"},
           {"kind": "sparse", "dataset": "urma-gust-ex", "ver": "v2", "field": "gust",
            "threshold_mph": 35.0, "lattice_step": 10, "station_points": true, "halo": 1, "exact": true},
           {"kind": "tile", "layer": "urma-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05", "enabled": false},
@@ -76,13 +79,13 @@
           "v80":  {"idx": "VGRD:80 m above ground:1 hour fcst", "grib": [0, 2, 3]}
         },
         "outputs": [
-          {"kind": "exact", "dataset": "hrrr-gust-x", "ver": "v1", "field": "gust", "store": "auto", "predictor": "dxy",
+          {"kind": "exact", "dataset": "hrrr-gust-x", "ver": "v2", "field": "gust", "store": "auto", "predictor": "med",
            "station_points": true},
-          {"kind": "exact", "dataset": "hrrr-wmax-x", "ver": "v1", "field": "wmax", "store": "auto", "predictor": "dxy"},
-          {"kind": "exact", "dataset": "hrrr-u10-x", "ver": "v1", "field": "u10", "store": "auto", "predictor": "dxy"},
-          {"kind": "exact", "dataset": "hrrr-v10-x", "ver": "v1", "field": "v10", "store": "auto", "predictor": "dxy"},
-          {"kind": "exact", "dataset": "hrrr-u80-x", "ver": "v1", "field": "u80", "store": "auto", "predictor": "dxy"},
-          {"kind": "exact", "dataset": "hrrr-v80-x", "ver": "v1", "field": "v80", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "hrrr-wmax-x", "ver": "v2", "field": "wmax", "store": "auto", "predictor": "med"},
+          {"kind": "exact", "dataset": "hrrr-u10-x", "ver": "v2", "field": "u10", "store": "auto", "predictor": "med"},
+          {"kind": "exact", "dataset": "hrrr-v10-x", "ver": "v2", "field": "v10", "store": "auto", "predictor": "med"},
+          {"kind": "exact", "dataset": "hrrr-u80-x", "ver": "v2", "field": "u80", "store": "auto", "predictor": "med"},
+          {"kind": "exact", "dataset": "hrrr-v80-x", "ver": "v2", "field": "v80", "store": "auto", "predictor": "med"},
           {"kind": "sparse", "dataset": "hrrr-gust-ex", "ver": "v2", "field": "gust",
            "threshold_mph": 30.0, "lattice_step": 10, "station_points": true, "halo": 1, "exact": true},
           {"kind": "sparse", "dataset": "hrrr-wmax-ex", "ver": "v2", "field": "wmax",
@@ -104,7 +107,7 @@
           "gust": {"idx": "GUST:10 m above ground:anl", "grib": [0, 2, 22]}
         },
         "outputs": [
-          {"kind": "exact", "dataset": "ru-gust-x", "ver": "v1", "field": "gust", "store": "auto", "predictor": "dxy"},
+          {"kind": "exact", "dataset": "ru-gust-x", "ver": "v2", "field": "gust", "store": "auto", "predictor": "dxy"},
           {"kind": "tile", "layer": "ru-gust-u8", "ver": "v1", "field": "gust", "enc": "mph05", "enabled": false,
            "overviews": [{"factor": 4, "layer": "ru-gust-u8-10k"}]}
         ],
@@ -132,7 +135,7 @@
         "prefix": "CONUS/MergedReflectivityQCComposite_00.50/{ymd}/",
         "time_regex": "_(\\d{8})-(\\d{6})\\.grib2\\.gz$", "pick_window_min": 2,
         "outputs": [
-          {"kind": "exact", "dataset": "refl-x", "ver": "v1", "store": "auto", "predictor": "raw"},
+          {"kind": "exact", "dataset": "refl-x", "ver": "v2", "store": "auto", "predictor": "med", "palette": "auto"},
           {"kind": "tile", "layer": "refl-u8", "ver": "v1", "enc": "dbz05", "enabled": false}
         ],
         "era": []
@@ -230,11 +233,11 @@
   },
 
   "breaker": {
-    "note": "2.5 TB in total for every lane. Fixed tiers = the other lanes' expected footprint: grids ~1,620 GB (exact grids 1,551 + ProbSevere ~50 + sparse cubes), observations ~179 GB, warnings ~131 GB",
+    "note": "2.5 TB in total for every lane is a budget, not a hard stop: above budget_gb after every cut the run logs a warning and records it in the run ledger, and carries on. Fixed tiers = the other lanes' expected footprint: grids ~1,620 GB (exact grids 1,551 + ProbSevere ~50 + sparse cubes), observations ~179 GB, warnings ~131 GB",
     "total_days": 1866,
     "fixed_gb_by_lane": {"noaa": 310.0, "iem": 1751.0, "vtec": 1799.0, "pilot": 0.0},
     "cut_gb": 2400.0,
-    "stop_gb": 2500.0,
+    "budget_gb": 2500.0,
     "integrity_fail_share": 0.005,
     "day_fail_share": 0.01,
     "bytes_per_day_factor": 1.3,

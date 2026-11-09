@@ -9,9 +9,10 @@ Rules:
   verified files fail;
 - failures: the run stops when more than 1 % of days fail after their retries;
 - size: projection = bytes so far / days done * total days + the lane's fixed tiers. Above ``cut_gb`` the next
-  enabled cut is applied to days not yet written (one cut per ``size_min_days`` days); above ``stop_gb`` with no cut
-  left, the run stops. A job stops when its bytes per day exceed ``bytes_per_day_factor`` x the expected rate on
-  ``bytes_per_day_streak`` days in a row;
+  enabled cut is applied to days not yet written (one cut per ``size_min_days`` days). ``budget_gb`` is a budget, not
+  a stop: above it with no cut left the job logs a warning and records a ``size-warning`` event in the run ledger
+  (once per job), and carries on. A job stops when its bytes per day exceed ``bytes_per_day_factor`` x the expected
+  rate on ``bytes_per_day_streak`` days in a row;
 - gaps: a gridded day with more than ``gap_unexplained_max`` unexplained missing steps fails; under the gap rule a
   source 404 is unexplained too unless the step is on the group's ``known_gaps`` list;
 - observation lane: repeated 429 / 503 bursts pause the lane; more than 5 % failed requests stop it;
@@ -99,6 +100,7 @@ class Breaker:
         self.sleep = sleep
         self.streak = 0
         self.size_min_days = int(cfg.get("size_min_days", 3))
+        self.size_warned = False
 
     # ---- state
     def active_cuts(self):
@@ -140,9 +142,17 @@ class Breaker:
                     self.ledger.totals["cut_at_days"] = agg["days_done"]
                     self.ledger.record("cut", cut=self.cuts[level]["id"], projection_gb=round(proj, 1))
                     log("cut", self.cuts[level]["id"], f"projection_gb={proj:.1f}")
-                elif level >= len(self.cuts) and proj > self.cfg["stop_gb"]:
-                    self.trip(f"size: projection {proj:.1f} GB above {self.cfg['stop_gb']} GB after every cut")
+                elif level >= len(self.cuts) and proj > self.cfg["budget_gb"]:
+                    self.warn_size(proj)
         return agg
+
+    def warn_size(self, proj):
+        """Projection above the budget after every cut: a warning (logged; recorded once per job), never a stop."""
+        log("WARNING", "size", f"projection_gb={proj:.1f}", f"budget_gb={self.cfg['budget_gb']}", "every cut applied")
+        if not self.size_warned:
+            self.size_warned = True
+            self.ledger.record("size-warning", projection_gb=round(proj, 1), budget_gb=self.cfg["budget_gb"],
+                               note="budget, not a stop: the run continues")
 
     def after_day(self, day, nbytes, failed, verified=0, verify_failed=0, unchanged=0):
         t = self.ledger.totals
