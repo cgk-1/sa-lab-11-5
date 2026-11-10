@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       lane:
-        description: "pilot | vtec | noaa | iem | verify"
+        description: "pilot | vtec | noaa | iem | madis | verify"
         type: choice
-        options: [pilot, vtec, noaa, iem, verify]
+        options: [pilot, vtec, noaa, iem, madis, verify]
         required: true
       start:
         description: "first UTC day, YYYY-MM-DD (not used by pilot)"
@@ -37,8 +37,10 @@ on:
 permissions:
   contents: read
 
+# One group per lane family: a run waits only behind a run of its own family. The mesonet lane (madis) has its own
+# group, so it never cancels, or waits behind, a gridded (noaa) or observation (iem / vtec / pilot) run.
 concurrency:
-  group: backfill-${{ inputs.lane == 'noaa' && 'noaa' || inputs.lane == 'verify' && 'verify' || 'iem' }}
+  group: backfill-${{ inputs.lane == 'noaa' && 'noaa' || inputs.lane == 'verify' && 'verify' || inputs.lane == 'madis' && 'madis' || 'iem' }}
   cancel-in-progress: false
 
 defaults:
@@ -53,6 +55,7 @@ jobs:
       noaa: ${{ steps.plan.outputs.noaa }}
       iem: ${{ steps.plan.outputs.iem }}
       verify: ${{ steps.plan.outputs.verify }}
+      madis: ${{ steps.plan.outputs.madis }}
       parallel: ${{ steps.plan.outputs.parallel }}
     steps:
       - name: Get this commit
@@ -161,6 +164,44 @@ jobs:
       - name: Fetch, compact, upload, verify (sequential, throttled)
         env:
           LANE: ${{ inputs.lane == 'vtec' && 'vtec' || 'iem' }}
+          CHUNK: ${{ matrix.chunk }}
+          RUN_KIND: ${{ inputs.lane }}
+          WRITE: ${{ inputs.write }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.run
+
+  madis:
+    # Mesonet tables, one month per job; no station catalogue needed. Two jobs at a time, each with at most two
+    # requests in flight to the archive (config hosts).
+    needs: plan
+    if: needs.plan.outputs.madis != '[]'
+    runs-on: ubuntu-24.04
+    environment: archive
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.madis) }}
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Offline self-test
+        run: cd code && ../.venv/bin/python -E -m feeder.selftest
+      - name: Fetch hourly files, build and check the day tables, upload, verify
+        env:
+          LANE: madis
           CHUNK: ${{ matrix.chunk }}
           RUN_KIND: ${{ inputs.lane }}
           WRITE: ${{ inputs.write }}

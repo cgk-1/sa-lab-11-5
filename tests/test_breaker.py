@@ -98,10 +98,15 @@ def test_caps_for_two_and_a_half_tb(bcfg):
     assert cfg["budget_gb"] == 2500.0 and cfg["cut_gb"] < cfg["budget_gb"] and "stop_gb" not in cfg
     assert {c["id"]: c["enabled"] for c in cuts}["refl-15min"] is False
     assert {c["id"]: c["enabled"] for c in cuts}["urma-wind-2h"] is False
-    # every lane's projection carries the other lanes' footprint; all lanes together stay inside the cap
+    # every lane's projection carries the other lanes' footprint (fixed[lane] = total - own[lane]); all lanes
+    # together stay inside the cap
     fixed = cfg["fixed_gb_by_lane"]
-    grids = fixed["iem"] + fixed["vtec"] - fixed["noaa"]  # = 2 x grids + iem + vtec - (iem + vtec)
-    assert abs(grids / 2 + fixed["noaa"] - 1930.0) < 1.0
+    lanes = ("noaa", "iem", "vtec", "madis")
+    total = sum(fixed[k] for k in lanes) / (len(lanes) - 1)
+    own = {k: total - fixed[k] for k in lanes}
+    assert abs(own["noaa"] - 1620.0) < 1.0 and abs(own["iem"] - 179.0) < 1.0 and abs(own["vtec"] - 131.0) < 1.0
+    assert abs(fixed["madis"] - 1930.0) < 1.0 and 0 < own["madis"] < 100.0
+    assert total < cfg["cut_gb"] < cfg["budget_gb"]
 
 
 def test_bytes_per_day_streak_stops_job(bcfg):

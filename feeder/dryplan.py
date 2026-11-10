@@ -8,7 +8,8 @@ station map when STATIONS=1, which reads the station catalogues). The day's stor
 ratios, and the total to date from the day.
 
 Environment: IN_DAY (YYYY-MM-DD), SAMPLE (1 / 0, default 1), SAMPLE_HOUR (UTC hour, default 21), STATIONS (1 / 0,
-default 1), CAP_GB (default 2500), OTHER_LANES_GB (observations and warnings, default 310).
+default 1), CAP_GB (default 2500), OTHER_LANES_GB (observations, warnings and mesonet tables; default: the gridded
+lane's fixed tier in the breaker config).
 """
 
 import concurrent.futures as cf
@@ -259,7 +260,8 @@ def main(env=None):
     http = Http(cfg)
     out = plan_day(cfg, http, day, sample=env.get("SAMPLE", "1") == "1",
                    sample_hour=int(env.get("SAMPLE_HOUR", "21")), stations=env.get("STATIONS", "1") == "1")
-    out["summary"] = summarise(out, cfg, float(env.get("CAP_GB", "2500")), float(env.get("OTHER_LANES_GB", "310")))
+    other_gb = float(env.get("OTHER_LANES_GB") or cfg["breaker"]["fixed_gb_by_lane"]["noaa"])
+    out["summary"] = summarise(out, cfg, float(env.get("CAP_GB", "2500")), other_gb)
     out["http"] = {"requests": http.stats["requests"], "by_status": http.stats["by_status"]}
     for oid, r in sorted(out["outputs"].items()):
         smp = r.get("sample") or {}

@@ -116,6 +116,36 @@ jobs:
           S3_SECRET: ${{ secrets.S3_SECRET }}
         run: cd code && ../.venv/bin/python -E -m feeder.daily
 
+  madis:
+    # Mesonet table of D (and of recent days still incomplete); its own job, so a slow or absent archive day never
+    # holds up the other lanes. The next daily-iem run indexes it.
+    runs-on: ubuntu-24.04
+    environment: archive
+    timeout-minutes: 120
+    steps:
+      - name: Get this commit
+        run: |
+          git init -q code
+          git -C code fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C code checkout -q FETCH_HEAD
+      - name: Install hash-pinned dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q --no-deps --require-hashes -r code/requirements.lock
+      - name: Offline self-test
+        run: cd code && ../.venv/bin/python -E -m feeder.selftest
+      - name: Append day D (mesonet), retry incomplete recent days
+        env:
+          LANE: daily-madis
+          IN_DAY: ${{ inputs.day }}
+          WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
+          CONTACT_EMAIL: ${{ vars.CONTACT_EMAIL }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+          S3_SECRET: ${{ secrets.S3_SECRET }}
+        run: cd code && ../.venv/bin/python -E -m feeder.daily
+
   keepalive:
     # Public repos: scheduled workflows are disabled after 60 days without repository activity.
     if: github.event_name == 'schedule'

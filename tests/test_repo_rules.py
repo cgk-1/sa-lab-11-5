@@ -91,7 +91,7 @@ def test_lock_is_hash_pinned():
         assert "--hash=sha256:" in block, pkg
     req = _read(os.path.join(ROOT, "requirements.in"))
     assert {line.split("=")[0].strip() for line in req.splitlines() if line and not line.startswith("#")} == \
-        {"numpy", "pygrib", "pyarrow", "zstandard", "boto3"}
+        {"numpy", "pygrib", "pyarrow", "scipy", "zstandard", "boto3"}
 
 
 def test_tree_is_generic():
@@ -108,3 +108,40 @@ def test_tree_is_generic():
             except UnicodeDecodeError:
                 continue
             assert not bad.search(text), p
+
+
+def _backfill_group(text, lane):
+    """The backfill concurrency group a dispatch of ``lane`` gets (the a && 'x' || b && 'y' || 'z' chain)."""
+    expr = re.search(r"^  group: backfill-\$\{\{ (.*) \}\}$", text, re.M).group(1)
+    for cond, val in re.findall(r"inputs\.lane == '([a-z]+)' && '([a-z]+)'", expr):
+        if cond == lane:
+            return val
+    return re.search(r"\|\| '([a-z]+)'$", expr).group(1)
+
+
+def test_madis_lane_has_its_own_concurrency_group():
+    text = _workflows()["backfill.yml"]
+    lanes = re.search(r"options: \[([a-z, ]+)\]", text).group(1).split(", ")
+    assert "madis" in lanes
+    groups = {lane: _backfill_group(text, lane) for lane in lanes}
+    assert groups["madis"] == "madis"
+    assert [lane for lane in lanes if groups[lane] == "madis"] == ["madis"]  # never shared with noaa / iem runs
+    assert groups["noaa"] == "noaa" and groups["iem"] == groups["vtec"] == groups["pilot"] == "iem"
+    assert "\nconcurrency:\n" in text and "  cancel-in-progress: false\n" in text
+
+
+def test_madis_jobs_in_both_workflows():
+    from feeder import plan
+
+    back = _workflows()["backfill.yml"]
+    for k in plan.OUTPUTS:  # every matrix the plan prints is a job output
+        assert f"      {k}: ${{{{ steps.plan.outputs.{k} }}}}\n" in back, k
+    job = back.split("\n  madis:\n", 1)[1].split("\n\n  ", 1)[0]
+    assert "    needs: plan\n" in job and "needs.plan.outputs.madis != '[]'" in job
+    assert "chunk: ${{ fromJSON(needs.plan.outputs.madis) }}" in job and "LANE: madis\n" in job
+    assert int(re.search(r"max-parallel: (\d+)", job).group(1)) <= 2
+    assert "feeder.selftest" in job and "--require-hashes" in job
+    daily = _workflows()["daily.yml"]
+    job = daily.split("\n  madis:\n", 1)[1].split("\n\n  ", 1)[0]
+    assert "\n    environment: archive\n" in job and "LANE: daily-madis\n" in job and "feeder.daily" in job
+    assert "WRITE: ${{ github.event_name == 'schedule' || inputs.write }}" in job

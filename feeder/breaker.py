@@ -8,8 +8,8 @@ Rules:
 - integrity: a decode-back / round-trip / sha mismatch fails the day at once; the run stops when more than 0.5 % of
   verified files fail;
 - failures: the run stops when more than 1 % of days fail after their retries;
-- size: projection = bytes so far / days done * total days + the lane's fixed tiers. Above ``cut_gb`` the next
-  enabled cut is applied to days not yet written (one cut per ``size_min_days`` days). ``budget_gb`` is a budget, not
+- size: projection = bytes so far / days done * the lane's total days + the lane's fixed tiers. Above ``cut_gb`` the
+  next enabled cut is applied to days not yet written (one cut per ``size_min_days`` days). ``budget_gb`` is a budget, not
   a stop: above it with no cut left the job logs a warning and records a ``size-warning`` event in the run ledger
   (once per job), and carries on. A job stops when its bytes per day exceed ``bytes_per_day_factor`` x the expected
   rate on ``bytes_per_day_streak`` days in a row;
@@ -111,7 +111,8 @@ class Breaker:
             return None
         per_day = agg["bytes"] / agg["days_done"]
         fixed = float(self.cfg.get("fixed_gb_by_lane", {}).get(self.lane, 0.0))
-        return per_day * float(self.cfg["total_days"]) / 1e9 + fixed
+        days = float((self.cfg.get("total_days_by_lane") or {}).get(self.lane, self.cfg["total_days"]))
+        return per_day * days / 1e9 + fixed
 
     def trip(self, reason, scope="run"):
         if scope in ("run", "lane"):

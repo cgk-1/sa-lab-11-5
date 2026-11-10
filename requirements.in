@@ -4,5 +4,6 @@
 numpy
 pygrib
 pyarrow
+scipy
 zstandard
 boto3

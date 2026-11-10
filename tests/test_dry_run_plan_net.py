@@ -100,7 +100,8 @@ def test_plan_main_output(monkeypatch, capsys):
         monkeypatch.setenv(k, v)
     assert plan.main() == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines == ['noaa=[]', 'iem=["2024-01-01..2024-01-31","2024-02-01..2024-02-10"]', 'verify=[]', 'parallel=1']
+    assert lines == ['noaa=[]', 'iem=["2024-01-01..2024-01-31","2024-02-01..2024-02-10"]', 'verify=[]', 'madis=[]',
+                     'parallel=1']
 
 
 # ---------------------------------------------------------------- net

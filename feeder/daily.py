@@ -3,7 +3,10 @@
 LANE=daily-noaa: gridded sources for day D (IN_DAY, blank = yesterday UTC); a new vintage of D-3 for any group whose
 source ETags changed or whose missing steps have since appeared; verify D.
 LANE=daily-iem: observation and other sources for D in day shape; re-pulls at REFRESH_OFFSETS (a new vintage only
-when the reply changed); verify D plus VERIFY_SEEDED_DAYS seeded older days; write the day index.
+when the reply changed); verify D plus VERIFY_SEEDED_DAYS seeded older days; write the day index (D and D-1, so a
+day's mesonet table, stored by its own job, is indexed by the next run at the latest).
+LANE=daily-madis: the mesonet table of D, then of each of the MADIS_CATCHUP_DAYS days before D (default: the
+config's ``catchup_days``) that has no complete table yet (an hour the archive published late).
 """
 
 import datetime as _dt
@@ -12,12 +15,12 @@ import os
 import random
 import sys
 
-from . import canonical_json, iem, load_config, log, noaa, other, utcnow
+from . import canonical_json, iem, load_config, log, noaa, other, parse_day as _iso_day, utcnow
 from .breaker import BreakerTripped
 from .manifest import complete_set, day_manifests, newest_entry
 from .plan import ARCHIVE_START, PlanError, parse_day
 from .run import (EXIT_TRIPPED, FATAL, Book, Ctx, _env_bool, _iem_enabled, finish_day, lane_verify,
-                  run_noaa_day)
+                  run_madis_day, run_noaa_day)
 from .store import Store, idx_key
 
 INDEX_VER = "v1"
@@ -104,8 +107,26 @@ def daily_iem(ctx, day, offsets, seeded):
     rng = random.Random(f"{ctx.run['id']}-{day.isoformat()}")
     older = sorted({ARCHIVE_START + _dt.timedelta(days=rng.randrange(span)) for _ in range(seeded)}) if span > 0 else []
     fails = lane_verify(ctx, [day] + older)
-    write_index(ctx, sorted(set(book.days()) | {day}))
+    prev = day - _dt.timedelta(days=1)
+    write_index(ctx, sorted(set(book.days()) | {day} | ({prev} if prev >= ARCHIVE_START else set())))
     return fails
+
+
+def daily_madis(ctx, day, catchup):
+    """D first, then the ``catchup`` days before it, oldest last; days with a complete table are skipped."""
+    spec = ctx.cfg["madis"]
+    if not spec.get("enabled"):
+        log("skip", spec["id"], "disabled")
+        return False
+    first = _iso_day(spec["start"])
+    failed = False
+    for k in range(0, int(catchup) + 1):
+        d = day - _dt.timedelta(days=k)
+        if d < first:
+            break
+        ctx.breaker.check_before_day()
+        failed = run_madis_day(ctx, d) or failed
+    return failed
 
 
 def write_index(ctx, days):
@@ -149,7 +170,7 @@ def write_index(ctx, days):
 def main(env=None):
     env = env if env is not None else os.environ
     lane = env.get("LANE", "")
-    if lane not in ("daily-noaa", "daily-iem"):
+    if lane not in ("daily-noaa", "daily-iem", "daily-madis"):
         print("daily: unknown LANE", file=sys.stderr)
         return 2
     today = utcnow().date()
@@ -160,12 +181,16 @@ def main(env=None):
         return 2
     cfg = load_config()
     store = Store.from_env(write=_env_bool("WRITE", True, env))
-    ctx = Ctx(cfg, "noaa" if lane == "daily-noaa" else "iem", f"{lane}-{day.isoformat()}", store)
+    kind = {"daily-noaa": "noaa", "daily-iem": "iem", "daily-madis": "madis"}[lane]
+    ctx = Ctx(cfg, kind, f"{lane}-{day.isoformat()}", store)
     log("start", lane, f"day={day}", f"write={store.write}", f"online={store.online}")
     code = 0
     try:
         if lane == "daily-noaa":
             code = 1 if daily_noaa(ctx, day) else 0
+        elif lane == "daily-madis":
+            catchup = int(env.get("MADIS_CATCHUP_DAYS") or cfg["madis"].get("catchup_days", 7))
+            code = 1 if daily_madis(ctx, day, catchup) else 0
         else:
             offsets = [int(x) for x in (env.get("REFRESH_OFFSETS") or "3,8,36,120").split(",") if x.strip()]
             seeded = int(env.get("VERIFY_SEEDED_DAYS") or "7")

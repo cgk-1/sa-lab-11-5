@@ -1,9 +1,9 @@
 """Lane entry point for manual runs: ``python -m feeder.run``.
 
-Environment: LANE (catalog | noaa | iem | vtec | verify; catalog needs no CHUNK), CHUNK (YYYY-MM-DD..YYYY-MM-DD), RUN_KIND (the dispatched lane:
-pilot | vtec | noaa | iem | verify), WRITE (true / false; false = dry run: fetch, build and check, upload nothing,
-print the manifests), CONTACT_EMAIL, FEEDER_PROCS (worker processes for the gridded lane; see feeder.par), and the
-storage secrets S3_ENDPOINT / S3_BUCKET / S3_KEY_ID / S3_SECRET.
+Environment: LANE (catalog | noaa | iem | vtec | madis | verify; catalog needs no CHUNK), CHUNK
+(YYYY-MM-DD..YYYY-MM-DD), RUN_KIND (the dispatched lane: pilot | vtec | noaa | iem | madis | verify), WRITE (true /
+false; false = dry run: fetch, build and check, upload nothing, print the manifests), CONTACT_EMAIL, FEEDER_PROCS
+(worker processes for the gridded lane; see feeder.par), and the storage secrets S3_ENDPOINT / S3_BUCKET / S3_KEY_ID / S3_SECRET.
 """
 
 import concurrent.futures as cf
@@ -15,9 +15,9 @@ import sys
 import tempfile
 import time
 
-from . import canonical_json, grib, iem, load_config, log, noaa, other, par, utcnow, verify
+from . import canonical_json, grib, iem, load_config, log, madis, noaa, other, par, parse_day, utcnow, verify
 from .breaker import Breaker, BreakerTripped, Ledger
-from .manifest import DatasetEntry, DayManifest, complete_set, day_manifests, iso
+from .manifest import DatasetEntry, DayManifest, complete_set, day_manifests, iso, newest_entry
 from .net import Http
 from .plan import parse_chunk
 from .store import IntegrityError, OverwriteRefused, PrefixError, Store, man_key, vintage_of, vrf_key
@@ -336,6 +336,36 @@ def lane_catalog(ctx):
     return failed
 
 
+def run_madis_day(ctx, day):
+    """The mesonet table of one day, unless a complete one is stored. Returns True if the day failed."""
+    spec = ctx.cfg["madis"]
+    mans = day_manifests(ctx.store, day)
+    if (spec["id"], spec["ver"]) in complete_set(mans):
+        log("skip", spec["id"], day.isoformat(), "complete")
+        return False
+    old = newest_entry(mans, spec["id"], spec["ver"])
+    book = Book(ctx)
+    res = madis.process_day(ctx, spec, day, supersedes=old["vintage"] if old else None)
+    book.add_group_result(day, res)
+    for r in res.reasons:
+        log("day-problem", spec["id"], day.isoformat(), r)
+    return finish_day(ctx, book, day, pilot=False)
+
+
+def lane_madis(ctx, start, end):
+    """Mesonet tables for start..end (days before the dataset's first day are skipped)."""
+    spec = ctx.cfg["madis"]
+    if not spec.get("enabled"):
+        log("skip", spec["id"], "disabled")
+        return
+    for day in _days(max(start, parse_day(spec["start"])), end):
+        if not ctx.within_budget():
+            log("budget", "stopping before", day.isoformat())
+            break
+        ctx.breaker.check_before_day()
+        run_madis_day(ctx, day)
+
+
 def verify_datasets(cfg):
     out = []
     for g in cfg["noaa"]["groups"]:
@@ -347,6 +377,8 @@ def verify_datasets(cfg):
                 out.append((o["dataset"], o["ver"], "src"))
     out += [(d["id"], d["ver"], "src") for d in cfg["iem"]["datasets"]]
     out += [(d["id"], d["ver"], "src") for d in cfg["other"]["datasets"]]
+    if cfg.get("madis"):
+        out.append((cfg["madis"]["id"], cfg["madis"]["ver"], "src"))
     out.append(("boxflags-vtec", "v1", "src"))
     return out
 
@@ -391,7 +423,7 @@ def main(env=None):
         except (ValueError, AttributeError):
             print("run: CHUNK must be YYYY-MM-DD..YYYY-MM-DD", file=sys.stderr)
             return 2
-    if lane not in ("noaa", "iem", "vtec", "verify", "catalog"):
+    if lane not in ("noaa", "iem", "vtec", "madis", "verify", "catalog"):
         print("run: unknown LANE", file=sys.stderr)
         return 2
     cfg = load_config()
@@ -408,6 +440,8 @@ def main(env=None):
             lane_noaa(ctx, start, end, pilot=(kind == "pilot"))
         elif lane in ("iem", "vtec"):
             lane_iem(ctx, start, end, "pilot" if kind == "pilot" else lane)
+        elif lane == "madis":
+            lane_madis(ctx, start, end)
         elif lane == "catalog":
             code = 1 if lane_catalog(ctx) else 0
         else:

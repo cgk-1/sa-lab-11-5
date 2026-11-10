@@ -8,6 +8,7 @@ import base64
 import datetime as _dt
 import hashlib
 import io
+import os
 import struct
 import sys
 import tempfile
@@ -131,6 +132,71 @@ def shp_zip(polygons):
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("warnings.shp", synthetic_shp(polygons))
     return buf.getvalue()
+
+
+FILL32 = np.float32(3.4028235e38)
+
+
+def synthetic_madis_nc(hour=0, n=12, seed=0, absent=(), types=None, extra=True):
+    """A tiny netCDF-3 file shaped like an hourly mesonet file: record dimension ``recNum``, character station ids
+    and providers (NUL-padded), float32 values with fill values, ``missing_value`` and a NaN with a payload, a -0.0,
+    DD (char) and QCR (int32) flags, records out of key order with repeats and one exact duplicate. ``absent``:
+    variables left out; ``types``: {variable: netCDF type code} overrides. Returns (bytes, {name: values written})."""
+    from scipy.io import netcdf_file
+
+    rng = np.random.default_rng(seed)
+    types = types or {}
+    t0 = 1680307200.0 + 3600.0 * hour  # 2023-04-01T00:00Z + hour
+    stations = [b"AB1", b"KXYZ", b"C77777", b"D"]
+    provs = [b"PROVA", b"MESO-NET-11", b"PROVA", b"X"]
+    pick = rng.integers(0, len(stations), n)
+    pick[1] = pick[0]  # a repeat of the same station
+    data = {
+        "stationId": np.array([list(stations[k].ljust(6, b"\0")) for k in pick], np.uint8).view("S1"),
+        "dataProvider": np.array([list(provs[k].ljust(11, b"\0")) for k in pick], np.uint8).view("S1"),
+        "latitude": np.array([35.0 + 0.5 * k for k in pick], ">f4"),
+        "longitude": np.array([-97.0 - 0.25 * k for k in pick], ">f4"),
+        "observationTime": (t0 + rng.integers(0, 3600, n)).astype(">f8"),
+        "elevation": np.full(n, 300.0, ">f4"),
+    }
+    data["observationTime"][1] = data["observationTime"][0] + 300.0
+    for f in ("windGust", "windSpeed", "windDir", "temperature", "altimeter", "precipAccum"):
+        v = (rng.random(n) * 30).astype(">f4")
+        v[2], v[3] = FILL32, np.float32(-9999.0)
+        data[f] = v
+        data[f + "DD"] = np.array([[c] for c in rng.choice(list(b"VSCZ"), n)], np.uint8).view("S1").reshape(n)
+        data[f + "QCR"] = rng.integers(0, 4, n).astype(">i4")
+    data["windGust"][4] = np.frombuffer(b"\x7f\xc0\x12\x34", ">f4")[0]  # NaN with a payload
+    data["windSpeed"][5] = np.float32(-0.0)
+    for k in data:  # an exact duplicate of the first record, last
+        data[k][-1] = data[k][0]
+    fd, path = tempfile.mkstemp(suffix=".nc")
+    os.close(fd)
+    f = netcdf_file(path, "w", version=1)
+    f.createDimension("recNum", None)
+    f.createDimension("maxStaIdLen", 6)
+    f.createDimension("maxStaTypeLen", 11)
+    out = {}
+    for name, arr in data.items():
+        if name in absent or (name == "elevation" and not extra):
+            continue
+        if name in ("stationId", "dataProvider"):
+            v = f.createVariable(name, "c", ("recNum", "maxStaIdLen" if name == "stationId" else "maxStaTypeLen"))
+        else:
+            tc = types.get(name, {"f4": "f", "f8": "d", "i4": "i", "S1": "c"}[arr.dtype.str[1:]])
+            arr = arr.astype(">" + {"f": "f4", "d": "f8", "i": "i4", "h": "i2"}[tc]) if tc != "c" else arr
+            v = f.createVariable(name, tc, ("recNum",))
+            if tc in "fd" and name not in ("observationTime",):
+                v._FillValue = arr.dtype.type(FILL32)
+                v.missing_value = arr.dtype.type(-9999.0)
+                v.units = b"meter/sec"
+        v[:] = arr
+        out[name] = arr
+    f.close()
+    with open(path, "rb") as fh:
+        body = fh.read()
+    os.unlink(path)
+    return body, out
 
 
 # ---------------------------------------------------------------- checks
@@ -344,6 +410,18 @@ def _checks():
         # the polygons straddle 97 W, so both neighbouring boxes are touched; the single third polygon is not enough
         assert got == sorted([stormbox.box_id(13, 5), stormbox.box_id(14, 5)]), got
 
+    def madis_table():
+        from . import madis
+
+        spec = cfg["madis"]
+        hours = [madis.parse_hour(synthetic_madis_nc(hour=h, seed=h)[0], spec, index=h) for h in (0, 1)]
+        hours.append(madis.parse_hour(synthetic_madis_nc(hour=2, seed=2, absent=("precipAccumDD",))[0], spec, 2))
+        blob = madis.to_parquet(spec, madis.build_table(spec, hours, {"schema": madis.SCHEMA}))
+        ok, why = madis.decode_back_ok(spec, blob, hours)
+        assert ok, why
+        hours[1].cols["windGust"][0] = np.float32(1.5)  # a changed value must be caught
+        assert not madis.decode_back_ok(spec, blob, hours)[0]
+
     def grib_lib():
         import importlib
 
@@ -353,7 +431,7 @@ def _checks():
             return "skipped (pygrib not installed)"
 
     return [("keys", keys), ("store", store), ("manifest", manifest), ("compact", compaction),
-            ("sparse", sparse_cube), ("exact", exact_grid), ("exact-v2", exact_v2), ("parallel", parallel), ("mesh-codes", mesh_codes), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("pygrib", grib_lib)]
+            ("sparse", sparse_cube), ("exact", exact_grid), ("exact-v2", exact_v2), ("parallel", parallel), ("mesh-codes", mesh_codes), ("tiles", tiles), ("breaker", breaker), ("boxes", boxes), ("madis", madis_table), ("pygrib", grib_lib)]
 
 
 def main():

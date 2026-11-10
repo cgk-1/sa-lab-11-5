@@ -2,8 +2,9 @@
 
 Inputs (environment only, never interpolated into shell text): IN_LANE, IN_START, IN_END, IN_DAYS, IN_DPJ, IN_PAR.
 Rules: days match ^\\d{4}-\\d{2}-\\d{2}$ and fall in [archive start, yesterday UTC]; the observation lane is always
-month chunks with one job at a time; pilot is one day per job, 3 in parallel, at most 10 days; every matrix holds at
-most 256 entries; unused lanes get []. Standard library only (runs before dependencies are installed).
+month chunks with one job at a time; the mesonet lane (madis) is month chunks from its first day (MADIS_START);
+pilot is one day per job, 3 in parallel, at most 10 days; every matrix holds at most 256 entries; unused lanes get [].
+Standard library only (runs before dependencies are installed).
 """
 
 import datetime as _dt
@@ -14,10 +15,12 @@ import re
 import sys
 
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-LANES = ("pilot", "vtec", "noaa", "iem", "verify")
+LANES = ("pilot", "vtec", "noaa", "iem", "madis", "verify")
+OUTPUTS = ("noaa", "iem", "verify", "madis")
 MAX_MATRIX = 256
 MAX_PARALLEL = 30
 ARCHIVE_START = _dt.date(2021, 10, 1)
+MADIS_START = _dt.date(2023, 3, 1)  # = config madis.start (a test keeps them equal; this module reads no config)
 
 
 class PlanError(Exception):
@@ -74,7 +77,8 @@ def plan(env, today=None):
     lane = (env.get("IN_LANE") or "").strip()
     if lane not in LANES:
         raise PlanError("lane: not one of " + ", ".join(LANES))
-    out = {"noaa": [], "iem": [], "verify": [], "parallel": 1}
+    out = {k: [] for k in OUTPUTS}
+    out["parallel"] = 1
     if lane == "pilot":
         raw = [x.strip() for x in (env.get("IN_DAYS") or "").split(",") if x.strip()]
         if not 1 <= len(raw) <= 10:
@@ -102,11 +106,15 @@ def plan(env, today=None):
         out["parallel"] = par
     elif lane in ("iem", "vtec"):
         out["iem"] = month_chunks(start, end)
+    elif lane == "madis":
+        if start < MADIS_START:
+            raise PlanError(f"start: the mesonet lane begins {MADIS_START}")
+        out["madis"] = month_chunks(start, end)
     elif lane == "verify":
         ndays = (end - start).days + 1
         per = max(7, math.ceil(ndays / MAX_MATRIX))
         out["verify"] = day_chunks(start, end, per)
-    for k in ("noaa", "iem", "verify"):
+    for k in OUTPUTS:
         if len(out[k]) > MAX_MATRIX:
             raise PlanError(f"{k}: {len(out[k])} jobs > {MAX_MATRIX}; split the range into smaller dispatches")
     return out
@@ -118,7 +126,7 @@ def main():
     except PlanError as err:
         print(f"plan: {err}", file=sys.stderr)
         return 1
-    for k in ("noaa", "iem", "verify"):
+    for k in OUTPUTS:
         print(f"{k}={json.dumps(out[k], separators=(',', ':'))}")
     print(f"parallel={int(out['parallel'])}")
     return 0
