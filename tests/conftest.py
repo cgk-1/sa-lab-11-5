@@ -292,6 +292,18 @@ def add_other(web):
             if url.endswith("/btk/"):
                 return 200, {}, b'<a href="bal012024.dat">x</a>'
             return 200, {}, b"AL, 01, 2024061900, , BEST\n"
+        if p.netloc == "www.nco.ncep.noaa.gov":
+            base = "https://www.nco.ncep.noaa.gov/pmb/codes/nwprod/"
+            if url == base:
+                return 200, {}, b'<a href="rtma.v2.10.9/">x</a><a href="rtma.v2.10.12/">x</a><a href="urma.v2.10.10/">x</a>'
+            for d in ("rtma.v2.10.12/fix/rtma2p5/", "rtma.v2.10.12/fix/rtma2p5_ru/", "urma.v2.10.10/fix/urma2p5/"):
+                pfx = d.split("/")[-2]
+                if url == base + d:
+                    return 200, {}, (f'<a href="{pfx}_mesonet_uselist.txt">{pfx}_mesonet_uselist.txt</a>'
+                                     f'<a href="{pfx}_t_day_rejectlist">x</a><a href="{pfx}_berror_stats.bin">x</a>').encode()
+                if url.startswith(base + d):
+                    return 200, {}, ("list " + url.rsplit("/", 1)[1] + "\n").encode()
+            return None
         if p.netloc == "www.spc.noaa.gov":
             if url.endswith("_rpts_filtered.csv"):
                 return 200, {}, b"Time,F_Scale,Location\n"

@@ -26,9 +26,33 @@ def _pack(name, body):
     return compact.zstd(body), "application/zstd"
 
 
+def latest_index(parent_body, ds):
+    """The index URL under a versioned parent: the highest version directory matching index_from.dir (its groups are
+    the version numbers), then index_from.sub. None when no directory matches."""
+    spec = ds["index_from"]
+    rx = re.compile(spec["dir"])
+    found = {m.group(0): tuple(int(g) for g in m.groups()) for m in rx.finditer(parent_body.decode("utf-8", "replace"))}
+    if not found:
+        return None
+    best = max(found, key=lambda k: found[k])
+    return spec["parent"] + best + spec["sub"]
+
+
 def run_listing(ctx, book, ds, today):
-    r = ctx.http.fetch(ds["index"])
     entry = book.entry(today, ds["id"], ds["ver"])
+    index = ds.get("index")
+    if ds.get("index_from"):
+        pr = ctx.http.fetch(ds["index_from"]["parent"])
+        entry["steps"]["expected"] += 1
+        if not pr.ok:
+            entry.add_missing(iso(ctx.started), pr.status, pr.tries)
+            return
+        entry["steps"]["got"] += 1
+        index = latest_index(pr.body, ds)
+        if index is None:
+            entry.add_missing(iso(ctx.started), 404, 1)
+            return
+    r = ctx.http.fetch(index)
     entry["steps"]["expected"] += 1
     if not r.ok:
         entry.add_missing(iso(ctx.started), r.status, r.tries)
@@ -45,7 +69,7 @@ def run_listing(ctx, book, ds, today):
             continue
         if not ctx.within_budget():
             break
-        fr = ctx.http.fetch(ds["index"] + name)
+        fr = ctx.http.fetch(index + name)
         entry["steps"]["expected"] += 1
         if not fr.ok:
             entry.add_missing(iso(ctx.started), fr.status, fr.tries)
