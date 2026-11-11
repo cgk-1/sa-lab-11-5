@@ -234,7 +234,7 @@
   },
 
   "madis": {
-    "id": "madis-mesonet", "ver": "v1", "enabled": true, "start": "2023-03-01",
+    "id": "madis-mesonet", "ver": "v1", "enabled": true, "start": "2021-10-01",
     "url": "https://madis-data.ncep.noaa.gov/madisPublic1/data/archive/{Y}/{m}/{d}/LDAD/mesonet/netCDF/{ymd}_{HH}00.gz",
     "cadence_min": 60, "known_gaps": [], "fetch_ahead": 2, "zstd_level": 19, "catchup_days": 7,
     "required": ["observationTime", "stationId", "dataProvider"],
@@ -250,10 +250,10 @@
   },
 
   "breaker": {
-    "note": "2.5 TB in total for every lane is a budget, not a hard stop: above budget_gb after every cut the run logs a warning and records it in the run ledger, and carries on. Fixed tiers = the other lanes' expected footprint: grids ~1,620 GB (exact grids 1,551 + ProbSevere ~50 + sparse cubes), observations ~179 GB, warnings ~131 GB, mesonet tables ~70 GB (1,350 days from 2023-03-01 at <= 52 MB a day; about 35 MB expected). A lane's projection uses its own day count (total_days_by_lane, else total_days)",
+    "note": "2.5 TB in total for every lane is a budget, not a hard stop: above budget_gb after every cut the run logs a warning and records it in the run ledger, and carries on. Fixed tiers = the other lanes' expected footprint: grids ~1,620 GB (exact grids 1,551 + ProbSevere ~50 + sparse cubes), observations ~179 GB, warnings ~131 GB, mesonet tables ~97 GB (1,866 days from 2021-10-01 at <= 52 MB a day; about 23-35 MB measured). A lane's projection uses its own day count (total_days_by_lane, else total_days)",
     "total_days": 1866,
-    "total_days_by_lane": {"madis": 1350},
-    "fixed_gb_by_lane": {"noaa": 380.0, "iem": 1821.0, "vtec": 1869.0, "madis": 1930.0, "pilot": 0.0},
+    "total_days_by_lane": {"madis": 1866},
+    "fixed_gb_by_lane": {"noaa": 406.8, "iem": 1847.8, "vtec": 1895.8, "madis": 1930.0, "pilot": 0.0},
     "cut_gb": 2400.0,
     "budget_gb": 2500.0,
     "integrity_fail_share": 0.005,

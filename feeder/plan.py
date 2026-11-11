@@ -20,7 +20,7 @@ OUTPUTS = ("noaa", "iem", "verify", "madis")
 MAX_MATRIX = 256
 MAX_PARALLEL = 30
 ARCHIVE_START = _dt.date(2021, 10, 1)
-MADIS_START = _dt.date(2023, 3, 1)  # = config madis.start (a test keeps them equal; this module reads no config)
+MADIS_START = _dt.date(2021, 10, 1)  # = config madis.start (a test keeps them equal; this module reads no config)
 
 
 class PlanError(Exception):

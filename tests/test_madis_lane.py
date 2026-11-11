@@ -290,7 +290,7 @@ def test_failed_decode_back_uploads_nothing(cfg, web, clock, s3, tmp_path, monke
 
 def test_lane_starts_at_the_dataset_start(cfg, web, clock, s3, tmp_path):
     ctx = make_ctx(cfg, web, clock, s3, tmp_path, lane="madis", job="madis-s")
-    lane_madis(ctx, _dt.date(2023, 2, 27), _dt.date(2023, 2, 28))
+    lane_madis(ctx, _dt.date(2021, 9, 29), _dt.date(2021, 9, 30))
     assert web.urls(HOST) == [] and _mans(s3) == []
 
 
@@ -355,8 +355,10 @@ def test_plan_madis_months_from_its_start():
     assert out["noaa"] == out["iem"] == out["verify"] == []
     whole = plan.plan({"IN_LANE": "madis", "IN_START": "2023-03-01", "IN_END": "2026-11-09"}, today)
     assert len(whole["madis"]) == 45
+    full = plan.plan({"IN_LANE": "madis", "IN_START": "2021-10-01", "IN_END": "2023-02-28"}, today)
+    assert len(full["madis"]) == 17 and full["madis"][0] == "2021-10-01..2021-10-31"
     with pytest.raises(plan.PlanError):
-        plan.plan({"IN_LANE": "madis", "IN_START": "2023-02-28", "IN_END": "2023-03-02"}, today)
+        plan.plan({"IN_LANE": "madis", "IN_START": "2021-09-30", "IN_END": "2021-10-02"}, today)
     assert plan.MADIS_START.isoformat() == load_config()["madis"]["start"]
 
 
