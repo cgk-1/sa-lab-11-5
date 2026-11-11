@@ -142,6 +142,16 @@
         "era": []
       },
       {
+        "id": "mrms-mesh2", "kind": "listed-all", "bucket": "noaa-mrms-pds", "overlap": true,
+        "prefix": "CONUS/MESH_00.50/{ymd}/",
+        "time_regex": "_(\\d{8})-(\\d{6})\\.grib2\\.gz$",
+        "note": "the 2-minute MESH files of the UTC day, every file as served (about 720 a day, ~45 MB); MESH_Max_60min is the hourly maximum of these",
+        "outputs": [
+          {"kind": "tar", "dataset": "mrms-mesh2-raw", "ver": "v1"}
+        ],
+        "era": []
+      },
+      {
         "id": "probsevere", "kind": "listed-all", "bucket": "noaa-mrms-pds", "overlap": true,
         "prefix": "ProbSevere/{ymd}/",
         "time_regex": "MRMS_PROBSEVERE_(\\d{8})_(\\d{6})\\.json$",
@@ -253,10 +263,10 @@
   },
 
   "breaker": {
-    "note": "2.5 TB in total for every lane is a budget, not a hard stop: above budget_gb after every cut the run logs a warning and records it in the run ledger, and carries on. Fixed tiers = the other lanes' expected footprint: grids ~1,620 GB (exact grids 1,551 + ProbSevere ~50 + sparse cubes), observations ~179 GB, warnings ~131 GB, mesonet tables ~97 GB (1,866 days from 2021-10-01 at <= 52 MB a day; about 23-35 MB measured). A lane's projection uses its own day count (total_days_by_lane, else total_days)",
+    "note": "2.5 TB in total for every lane is a budget, not a hard stop: above budget_gb after every cut the run logs a warning and records it in the run ledger, and carries on. Fixed tiers = the other lanes' expected footprint: grids ~1,620 GB (exact grids 1,551 + ProbSevere ~50 + sparse cubes), observations ~179 GB, warnings ~131 GB, mesonet tables ~97 GB (1,866 days from 2021-10-01 at <= 52 MB a day; about 23-35 MB measured). 2-min MESH bundles ~84 GB (1,866 days at ~45 MB) are counted in the other lanes' fixed tiers (grids +84). A lane's projection uses its own day count (total_days_by_lane, else total_days)",
     "total_days": 1866,
     "total_days_by_lane": {"madis": 1866},
-    "fixed_gb_by_lane": {"noaa": 406.8, "iem": 1847.8, "vtec": 1895.8, "madis": 1930.0, "pilot": 0.0},
+    "fixed_gb_by_lane": {"noaa": 406.8, "iem": 1931.8, "vtec": 1979.8, "madis": 2014.0, "pilot": 0.0},
     "cut_gb": 2400.0,
     "budget_gb": 2500.0,
     "integrity_fail_share": 0.005,

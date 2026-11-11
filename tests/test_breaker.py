@@ -104,8 +104,9 @@ def test_caps_for_two_and_a_half_tb(bcfg):
     lanes = ("noaa", "iem", "vtec", "madis")
     total = sum(fixed[k] for k in lanes) / (len(lanes) - 1)
     own = {k: total - fixed[k] for k in lanes}
-    assert abs(own["noaa"] - 1620.0) < 1.0 and abs(own["iem"] - 179.0) < 1.0 and abs(own["vtec"] - 131.0) < 1.0
-    assert abs(fixed["madis"] - 1930.0) < 1.0 and 0 < own["madis"] < 100.0
+    assert abs(own["noaa"] - 1704.0) < 1.0  # 1,620 + 84 GB of 2-min MESH bundles
+    assert abs(own["iem"] - 179.0) < 1.0 and abs(own["vtec"] - 131.0) < 1.0
+    assert abs(fixed["madis"] - 2014.0) < 1.0 and 0 < own["madis"] < 100.0
     assert total < cfg["cut_gb"] < cfg["budget_gb"]
 
 

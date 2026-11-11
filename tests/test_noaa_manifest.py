@@ -412,3 +412,39 @@ def test_verify_lane_passes_on_infrequent_access_objects(cfg, web, clock, s3, tm
     assert "STANDARD_IA" in set(_classes(s3).values())
     vctx = make_ctx(cfg, web, clock, s3, tmp_path, lane="verify", job="verify-ia", run_id="904")
     assert lane_verify(vctx, [DAY], check_all=True) == 0
+
+
+def test_mesh_two_minute_bundle(cfg, web, clock, s3, tmp_path):
+    """mrms-mesh2: every 2-min MESH file of the UTC day folder is kept as served, in one bundle with a round-trip check."""
+    import gzip
+
+    from conftest import fake_message
+
+    names = [f"MRMS_MESH_00.50_{DAY:%Y%m%d}-{h:02d}{m:02d}37.grib2.gz" for h in range(2) for m in (0, 2, 4)]
+
+    def fn(url, p):
+        if p.netloc != "noaa-mrms-pds.s3.amazonaws.com":
+            return None
+        if p.path == "/" and "MESH_00.50" in p.query:
+            assert f"prefix=CONUS%2FMESH_00.50%2F{DAY:%Y%m%d}%2F" in p.query, p.query
+            keys = "".join(f"<Contents><Key>CONUS/MESH_00.50/{DAY:%Y%m%d}/{n}</Key><ETag>\"e{i}\"</ETag><Size>10</Size></Contents>"
+                           for i, n in enumerate(names))
+            return 200, {}, ('<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">' + keys +
+                             "<IsTruncated>false</IsTruncated></ListBucketResult>").encode()
+        if p.path.endswith(".grib2.gz") and "/MESH_00.50/" in p.path:
+            v = np.zeros((NY, NX))
+            v[0:3, 0:3] = 25.0
+            return 200, {}, gzip.compress(fake_message((209, 3, 28), v), mtime=0)
+        return None
+
+    web.route(fn)
+    ctx = make_ctx(cfg, web, clock, s3, tmp_path, groups=["mrms-mesh2"])
+    lane_noaa(ctx, DAY, DAY, pilot=True)
+    m = _manifests(s3)[0]
+    by = {d["id"]: d for d in m["datasets"]}
+    e = by["mrms-mesh2-raw"]
+    assert e["ver"] == "v1" and e["status"] == "complete" and e["checks"]["members"] == len(names)
+    key = e["objects"][0]["key"]
+    blob = s3.objects[key][0]
+    members = compact.untar(compact.unzstd(blob) if key.endswith(".zst") else blob)
+    assert len(members) == len(names)
